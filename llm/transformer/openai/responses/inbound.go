@@ -366,6 +366,19 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 			continue
 		}
 
+		// Group consecutive tool calls and fold any reasoning that appears before
+		// the matching tool output. Strict Chat providers reject an intervening
+		// assistant-only reasoning message as a missing tool output.
+		if item.Type == "function_call" || item.Type == "custom_tool_call" {
+			msg, consumed, err := convertConsecutiveToolCalls(input.Items, i)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, *msg)
+			i += consumed
+			continue
+		}
+
 		// Handle regular items
 		msg, err := convertItemToMessage(item)
 		if err != nil {
@@ -380,6 +393,59 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 	}
 
 	return messages, nil
+}
+
+// convertConsecutiveToolCalls merges adjacent Responses tool-call input items
+// into one canonical assistant message. Reasoning items that appear between a
+// tool call and its tool output are attached to this assistant message so Chat
+// history keeps assistant(tool_calls) immediately followed by role=tool.
+func convertConsecutiveToolCalls(items []Item, startIdx int) (*llm.Message, int, error) {
+	msg := &llm.Message{Role: "assistant"}
+	consumed := 0
+	var reasoningText strings.Builder
+
+	for index := startIdx; index < len(items); index++ {
+		item := &items[index]
+		switch item.Type {
+		case "function_call", "custom_tool_call":
+			toolCallMessage, err := convertItemToMessage(item)
+			if err != nil {
+				return nil, 0, err
+			}
+			if toolCallMessage != nil {
+				msg.ToolCalls = append(msg.ToolCalls, toolCallMessage.ToolCalls...)
+			}
+			consumed++
+		case "reasoning":
+			if len(msg.ToolCalls) == 0 {
+				if reasoningText.Len() > 0 {
+					msg.ReasoningContent = lo.ToPtr(reasoningText.String())
+				}
+				return msg, consumed, nil
+			}
+			if msg.ReasoningSignature == nil && item.EncryptedContent != nil {
+				msg.ReasoningSignature = item.EncryptedContent
+			}
+			itemText := strings.Builder{}
+			for _, summary := range item.Summary {
+				itemText.WriteString(summary.Text)
+			}
+			if itemText.Len() > 0 {
+				reasoningText.WriteString(itemText.String())
+			}
+			consumed++
+		default:
+			if reasoningText.Len() > 0 {
+				msg.ReasoningContent = lo.ToPtr(reasoningText.String())
+			}
+			return msg, consumed, nil
+		}
+	}
+
+	if reasoningText.Len() > 0 {
+		msg.ReasoningContent = lo.ToPtr(reasoningText.String())
+	}
+	return msg, consumed, nil
 }
 
 // convertReasoningWithFollowing converts a reasoning item and merges it with subsequent
