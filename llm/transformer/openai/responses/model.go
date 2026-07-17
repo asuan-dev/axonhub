@@ -37,8 +37,9 @@ type Tool struct {
 	Format *CustomToolFormat `json:"format,omitempty"`
 
 	// These fields are for web search.
-	Filters      *WebSearchFilters      `json:"filters,omitempty"`
-	UserLocation *WebSearchUserLocation `json:"user_location,omitempty"`
+	Filters           *WebSearchFilters      `json:"filters,omitempty"`
+	SearchContextSize string                 `json:"search_context_size,omitempty"`
+	UserLocation      *WebSearchUserLocation `json:"user_location,omitempty"`
 
 	// This field is for ImageGeneration
 	Action string `json:"action,omitempty"`
@@ -62,6 +63,9 @@ type Tool struct {
 	Quality string `json:"quality,omitempty"`
 	// This field is for ImageGeneration
 	Size string `json:"size,omitempty"`
+
+	// Tools holds sub-tools for namespace type.
+	Tools []Tool `json:"tools,omitempty"`
 }
 
 type WebSearchFilters struct {
@@ -96,6 +100,11 @@ type Request struct {
 
 	Temperature *float64 `json:"temperature,omitempty"`
 
+	// FrequencyPenalty penalizes frequent tokens (sampling parameter).
+	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+	// PresencePenalty penalizes already-present tokens (sampling parameter).
+	PresencePenalty *float64 `json:"presence_penalty,omitempty"`
+
 	// Input can be a string prompt or an array of input items.
 	Input Input `json:"input"`
 	// Tools includes the function/image_generation/web_search/custom tools.
@@ -112,6 +121,8 @@ type Request struct {
 	SafetyIdentifier *string           `json:"safety_identifier,omitempty"`
 	User             *string           `json:"user,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
+	ClientMetadata   map[string]string `json:"client_metadata,omitempty"`
+	CacheControl     *CacheControl     `json:"cache_control,omitempty"`
 	MaxOutputTokens  *int64            `json:"max_output_tokens,omitempty"`
 	MaxToolCalls     *int64            `json:"max_tool_calls,omitempty"`
 	Text             *TextOptions      `json:"text,omitempty"`
@@ -124,8 +135,7 @@ type Request struct {
 	PreviousResponseID *string `json:"previous_response_id,omitempty"`
 
 	// Reference to a prompt template and its variables.
-	// TODO
-	// Prompt *Prompt `json:"prompt,omitempty"`
+	Prompt *Prompt `json:"prompt,omitempty"`
 
 	// Used by OpenAI to cache responses for similar requests.
 	PromptCacheKey *string `json:"prompt_cache_key,omitempty"`
@@ -153,27 +163,41 @@ type Request struct {
 
 	// Nucleus sampling parameter.
 	TopP *float64 `json:"top_p,omitempty"`
+
+	// TopK for top-k sampling (OpenRouter extension).
+	TopK *int64 `json:"top_k,omitempty"`
 }
 
 // Prompt represents a reference to a prompt template.
 type Prompt struct {
-	ID        string            `json:"id"`
-	Version   *string           `json:"version,omitempty"`
-	Variables map[string]string `json:"variables,omitempty"`
+	ID        string                     `json:"id"`
+	Version   *string                    `json:"version,omitempty"`
+	Variables map[string]json.RawMessage `json:"variables,omitempty"`
 }
 
 // Reasoning represents configuration options for reasoning models.
 type Reasoning struct {
-	// The reasoning context scope requested by internal Responses features.
-	Context string `json:"context,omitempty"`
 	// The effort level for reasoning. Any of "low", "medium", "high".
 	Effort string `json:"effort,omitempty"`
+	// Context controls which reasoning items are rendered back on later turns.
+	// Any of "auto", "current_turn", "all_turns".
+	Context string `json:"context,omitempty"`
 	// Whether to generate a summary of the reasoning. Any of "auto", "concise", "detailed".
+	// Deprecated: use Summary instead. Keep as a separate wire field so
+	// same-protocol clients can still send/receive generate_summary.
 	GenerateSummary string `json:"generate_summary,omitempty"`
 	// The summary type. Any of "auto", "concise", "detailed".
 	Summary string `json:"summary,omitempty"`
+	// Enabled toggles reasoning mode (OpenRouter ReasoningConfig.enabled, nullable bool).
+	Enabled *bool `json:"enabled,omitempty"`
 	// Maximum number of reasoning tokens.
 	MaxTokens *int64 `json:"max_tokens,omitempty"`
+}
+
+// CacheControl mirrors the OpenRouter/Anthropic top-level cache_control directive.
+type CacheControl struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
 }
 
 // StreamOptions represents options for streaming responses.
@@ -424,6 +448,61 @@ type URLCitation struct {
 
 const responsesWebSearchCallsTransformerMetadataKey = "openai_responses_web_search_calls"
 const responsesReasoningItemTransformerMetadataKey = "openai_responses_reasoning_item"
+const responsesReasoningEnabledTransformerMetadataKey = "openai_responses_reasoning_enabled"
+const responsesReasoningContextTransformerMetadataKey = "openai_responses_reasoning_context"
+const responsesReasoningGenerateSummaryOriginTransformerMetadataKey = "openai_responses_reasoning_generate_summary_origin"
+const responsesReasoningGenerateSummaryValueTransformerMetadataKey = "openai_responses_reasoning_generate_summary_value"
+const responsesReasoningRawObjectTransformerMetadataKey = "openai_responses_reasoning_raw_object"
+const responsesReasoningTextContentTransformerMetadataKey = "openai_responses_reasoning_text_content"
+const responsesReasoningSummaryContentTransformerMetadataKey = "openai_responses_reasoning_summary_content"
+const responsesReasoningPreferTextStreamTransformerMetadataKey = "openai_responses_reasoning_prefer_text_stream"
+const responsesNamespaceToolMapTransformerMetadataKey = "openai_responses_namespace_tool_map"
+
+const responsesBackgroundTransformerMetadataKey = "background"
+const responsesTruncationTransformerMetadataKey = "truncation"
+const responsesPromptCacheRetentionTransformerMetadataKey = "prompt_cache_retention"
+const responsesMaxToolCallsTransformerMetadataKey = "max_tool_calls"
+const responsesImageOutputFormatTransformerMetadataKey = "image_output_format"
+
+const responsesImageGenOutputFormatTransformerMetadataKey = "output_format"
+const responsesImageGenQualityTransformerMetadataKey = "quality"
+const responsesImageGenSizeTransformerMetadataKey = "size"
+const responsesImageGenActionTransformerMetadataKey = "image_generation_action"
+
+const responsesInputFileURLPartTransformerMetadataKey = "openai_responses_input_file_url"
+const responsesInputFileDetailPartTransformerMetadataKey = "openai_responses_input_file_detail"
+
+// namespaceToolEntry records the leaf name and namespace group for a namespace
+// tool that was flattened into a composite "grp__leaf" function during inbound
+// conversion. It lets the outbound side restore {name, namespace} via table
+// lookup rather than string splitting (group names may themselves contain "__").
+type namespaceToolEntry struct {
+	Leaf      string `json:"leaf"`
+	Namespace string `json:"namespace"`
+}
+
+// resolveNamespaceFromMetadata looks up a composite function name in the
+// namespace tool map stored in TransformerMetadata. If found, it returns the
+// leaf name and namespace; otherwise it returns the original name with an empty
+// namespace (flat tools that were never part of a namespace group).
+func resolveNamespaceFromMetadata(metadata map[string]any, compositeName string) (name, namespace string) {
+	if len(metadata) == 0 || compositeName == "" {
+		return compositeName, ""
+	}
+	raw, ok := metadata[responsesNamespaceToolMapTransformerMetadataKey]
+	if !ok || raw == nil {
+		return compositeName, ""
+	}
+	m, ok := raw.(map[string]namespaceToolEntry)
+	if !ok {
+		return compositeName, ""
+	}
+	entry, ok := m[compositeName]
+	if !ok {
+		return compositeName, ""
+	}
+	return entry.Leaf, entry.Namespace
+}
 
 type responsesReasoningItemMetadata struct {
 	ID   string `json:"id,omitempty"`
@@ -441,6 +520,8 @@ type WebSearchAction struct {
 	Query   string            `json:"query,omitempty"`
 	Queries []string          `json:"queries,omitempty"`
 	Sources []WebSearchSource `json:"sources,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Pattern string            `json:"pattern,omitempty"`
 }
 
 // ItemAction is the polymorphic "action" field of an output item.
@@ -512,10 +593,14 @@ func (a ItemAction) MarshalJSON() ([]byte, error) {
 // This follows the openai-go pattern where input and output items share the same structure.
 // Reference: github.com/openai/openai-go/v3/responses.ResponseOutputItemUnion.
 type Item struct {
+	// Raw is set only for same-protocol replay of an output item without a
+	// canonical representation. It is never used as a cross-protocol carrier.
+	Raw json.RawMessage `json:"-"`
+
 	// The ID of the item, generated by the server.
 	ID string `json:"id,omitempty"`
 
-	// Any of "message", "input_text", "input_image", "input_audio", "output_text", "compaction", "compaction_summary",
+	// Any of "message", "input_text", "input_image", "input_audio", "input_file", "output_text", "compaction", "compaction_summary",
 	// "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "image_generation_call", "reasoning", "reasoning_text".
 	Type string `json:"type,omitempty"`
 
@@ -537,11 +622,23 @@ type Item struct {
 	// The URL of the image url or base64 encoded image, for input_image type.
 	ImageURL *string `json:"image_url,omitempty"`
 
-	// The detail of the image. high, low, or auto, for input_image type.
+	// The detail level for input_image or input_file.
 	Detail *string `json:"detail,omitempty"`
+
+	// InputAudio is the audio data, for input_audio type.
+	InputAudio *llm.InputAudio `json:"input_audio,omitempty"`
+
+	// Input file fields for input_file type.
+	FileData *string `json:"file_data,omitempty"`
+	FileID   *string `json:"file_id,omitempty"`
+	FileURL  *string `json:"file_url,omitempty"`
+	Filename *string `json:"filename,omitempty"`
 
 	// Text for output_text/input_text type.
 	Text *string `json:"text,omitempty"`
+
+	// Refusal explanation for type="refusal" output content parts.
+	Refusal *string `json:"refusal,omitempty"`
 
 	// Image generation fields
 
@@ -551,6 +648,8 @@ type Item struct {
 	OutputFormat *string `json:"output_format,omitempty"`
 	// Quality for image generated, e.g: low
 	Quality *string `json:"quality,omitempty"`
+	// RevisedPrompt is the prompt revised by the image generation model.
+	RevisedPrompt *string `json:"revised_prompt,omitempty"`
 	// Size for image generated, e.g: 1024x1024
 	Size *string `json:"size,omitempty"`
 
@@ -574,7 +673,8 @@ type Item struct {
 	// Reasoning summary content - array of summary text items.
 	Summary []ReasoningSummary `json:"summary,omitempty"`
 	// Reasoning text content - array of reasoning text items.
-	ReasoningContent []ReasoningContent `json:"reasoning_content,omitempty"`
+	// Wire field is "content" for type=reasoning; handled by custom JSON methods.
+	ReasoningContent []ReasoningContent `json:"-"`
 	// The encrypted content of the reasoning item.
 	EncryptedContent *string `json:"encrypted_content,omitempty"`
 
@@ -599,6 +699,25 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 	}
 
 	*item = Item(raw.itemAlias)
+
+	// For reasoning items, wire "content" is reasoning_text parts, not message Content.
+	if item.Type == "reasoning" && item.Content != nil && len(item.Content.Items) > 0 {
+		parts := make([]ReasoningContent, 0, len(item.Content.Items))
+		for _, part := range item.Content.Items {
+			text := ""
+			if part.Text != nil {
+				text = *part.Text
+			}
+			partType := part.Type
+			if partType == "" {
+				partType = "reasoning_text"
+			}
+			parts = append(parts, ReasoningContent{Type: partType, Text: text})
+		}
+		item.ReasoningContent = parts
+		item.Content = nil
+	}
+
 	if len(raw.Arguments) == 0 || bytes.Equal(raw.Arguments, []byte("null")) {
 		return nil
 	}
@@ -620,6 +739,9 @@ func (item *Item) UnmarshalJSON(data []byte) error {
 
 // MarshalJSON omits summary for non-reasoning items and forces an empty array for reasoning items.
 func (item Item) MarshalJSON() ([]byte, error) {
+	if len(item.Raw) > 0 {
+		return item.Raw, nil
+	}
 	type itemAlias Item
 
 	if item.Type == "function_call" {
@@ -676,11 +798,13 @@ func (item Item) MarshalJSON() ([]byte, error) {
 		return json.Marshal(itemAlias(item))
 	}
 
-	// Ensure reasoning items always include summary, even if empty.
+	// Ensure reasoning items always include summary, even if empty, and emit
+	// content[] for reasoning_text parts.
 	type reasoningItem struct {
 		itemAlias
 
 		Summary []ReasoningSummary `json:"summary"`
+		Content []ReasoningContent `json:"content,omitempty"`
 	}
 
 	summary := item.Summary
@@ -691,6 +815,7 @@ func (item Item) MarshalJSON() ([]byte, error) {
 	return json.Marshal(reasoningItem{
 		itemAlias: itemAlias(item),
 		Summary:   summary,
+		Content:   item.ReasoningContent,
 	})
 }
 
@@ -701,7 +826,7 @@ func (item Item) isOutputMessageContent() bool {
 	}
 
 	for _, ci := range item.Content.Items {
-		if ci.Type == "output_text" {
+		if ci.Type == "output_text" || ci.Type == "refusal" {
 			return true
 		}
 	}

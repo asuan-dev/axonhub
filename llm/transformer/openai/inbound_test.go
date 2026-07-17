@@ -1208,3 +1208,295 @@ func TestInboundTransformer_TransformResponse_WithGeminiPrefixedToolCallMetadata
 		oaiResp.Choices[0].Message.ToolCalls[0].ExtraContent.Google.ThoughtSignature,
 	)
 }
+
+// D25/C13: logit_bias must accept float values (OpenRouter spec allows double).
+func TestInboundTransformer_TransformRequest_LogitBiasAcceptsFloat(t *testing.T) {
+	transformer := NewInboundTransformer()
+
+	req := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"logit_bias":{"5043":-100.5}}`),
+	}
+
+	got, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err, "float logit_bias should decode (OpenRouter spec allows double)")
+	require.NotNil(t, got.LogitBias, "LogitBias must be populated")
+	require.Contains(t, got.LogitBias, "5043", "LogitBias must carry token 5043")
+	require.InDelta(t, -100.5, got.LogitBias["5043"], 0.0001, "float logit_bias value must be preserved exactly")
+}
+
+// D25/C13: completion path (/v1/completions) must also accept float logit_bias.
+func TestCompletionInboundTransformer_TransformRequest_LogitBiasAcceptsFloat(t *testing.T) {
+	transformer := NewCompletionInboundTransformer()
+
+	req := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"gpt-3.5-turbo-instruct","prompt":"hi","logit_bias":{"5043":-100.5}}`),
+	}
+
+	got, err := transformer.TransformRequest(context.Background(), req)
+	require.NoError(t, err, "float logit_bias should decode in /v1/completions")
+	require.NotNil(t, got.Completion, "Completion must be populated")
+	require.NotNil(t, got.Completion.LogitBias, "Completion.LogitBias must be populated")
+	require.InDelta(t, -100.5, got.Completion.LogitBias["5043"], 0.0001, "float logit_bias value must be preserved on completion path")
+}
+
+// C3/D23: chat top_k must survive chat→canonical→chat round-trip.
+func TestInboundTransformer_TransformRequest_TopKRoundTripChat(t *testing.T) {
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"top_k":40}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+
+	outReq := RequestFromLLM(llmReq, ReasoningFieldNone)
+	require.NotNil(t, outReq.TopK, "C3: chat top_k must survive chat→canonical→chat round-trip")
+	require.Equal(t, int64(40), *outReq.TopK)
+}
+
+// C7/C8/C9 (D24): OpenRouter sampling knobs must survive chat round-trip.
+func TestInboundTransformer_TransformRequest_OpenRouterSamplingRoundTrip(t *testing.T) {
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"repetition_penalty":1.15,"min_p":0.05,"top_a":0.8}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+
+	outReq := RequestFromLLM(llmReq, ReasoningFieldNone)
+	require.NotNil(t, outReq.RepetitionPenalty, "C7: repetition_penalty must survive round-trip")
+	require.InDelta(t, 1.15, *outReq.RepetitionPenalty, 0.0001)
+	require.NotNil(t, outReq.MinP, "C8: min_p must survive round-trip")
+	require.InDelta(t, 0.05, *outReq.MinP, 0.0001)
+	require.NotNil(t, outReq.TopA, "C9: top_a must survive round-trip")
+	require.InDelta(t, 0.8, *outReq.TopA, 0.0001)
+}
+
+// #4/D20: OpenRouter chat `reasoning` object {effort, summary} must be captured
+// into canonical slots. Without the object field the whole object is dropped by
+// lenient Unmarshal (only the flat reasoning_effort shorthand survived before).
+func TestInboundTransformer_TransformRequest_ReasoningObjectCaptured(t *testing.T) {
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"o3","messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"high","summary":"concise"}}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+	require.Equal(t, "high", llmReq.ReasoningEffort, "#4: reasoning.effort object must be captured")
+	require.NotNil(t, llmReq.ReasoningSummary, "#4: reasoning.summary object must be captured")
+	require.Equal(t, "concise", *llmReq.ReasoningSummary)
+}
+
+// #4/D20: object form overrides flat shorthand when both present (spec: cannot be
+// used simultaneously if they differ; object is the explicit form).
+func TestInboundTransformer_TransformRequest_ReasoningObjectOverridesFlat(t *testing.T) {
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"o3","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low","reasoning_summary":"detailed","reasoning":{"effort":"high","summary":"concise"}}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+	require.Equal(t, "high", llmReq.ReasoningEffort, "#4: object effort must override flat shorthand")
+	require.NotNil(t, llmReq.ReasoningSummary)
+	require.Equal(t, "concise", *llmReq.ReasoningSummary, "#4: object summary must override flat shorthand")
+}
+
+// #4/D20: flat shorthand still works when no object is present (no regression).
+func TestInboundTransformer_TransformRequest_ReasoningFlatFallback(t *testing.T) {
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"o3","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"medium"}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+	require.Equal(t, "medium", llmReq.ReasoningEffort, "#4: flat shorthand must still work")
+}
+
+// #4/D20: chat reasoning object survives chat→canonical→chat round-trip via the
+// canonical slots (outbound re-emits flat reasoning_effort/reasoning_summary).
+func TestInboundTransformer_TransformRequest_ReasoningObjectRoundTrip(t *testing.T) {
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"o3","messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"xhigh","summary":"detailed"}}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+
+	outReq := RequestFromLLM(llmReq, ReasoningFieldNone)
+	require.Equal(t, "xhigh", outReq.ReasoningEffort, "#4: reasoning.effort must survive round-trip")
+	require.NotNil(t, outReq.ReasoningSummary)
+	require.Equal(t, "detailed", *outReq.ReasoningSummary, "#4: reasoning.summary must survive round-trip")
+}
+
+// Forward-compat: unknown Chat reasoning_effort strings must survive same-protocol
+// chat → canonical → chat outbound without reject/downgrade/replace.
+func TestInboundTransformer_UnknownReasoningEffortFlatRoundTripChat(t *testing.T) {
+	const futureEffort = "future-effort"
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"o3","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"` + futureEffort + `"}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+	require.Equal(t, futureEffort, llmReq.ReasoningEffort, "unknown flat reasoning_effort must be captured verbatim")
+
+	outReq := RequestFromLLM(llmReq, ReasoningFieldNone)
+	require.Equal(t, futureEffort, outReq.ReasoningEffort, "unknown effort must survive chat→canonical→chat convert")
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-key")
+	require.NoError(t, err)
+	upstreamReq, err := outbound.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var outboundBody map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(upstreamReq.Body, &outboundBody))
+	require.Contains(t, outboundBody, "reasoning_effort")
+	var effort string
+	require.NoError(t, json.Unmarshal(outboundBody["reasoning_effort"], &effort))
+	require.Equal(t, futureEffort, effort, "unknown reasoning_effort must be re-emitted on Chat wire unchanged")
+}
+
+// Forward-compat: unknown Chat reasoning.effort object form must also preserve
+// the exact string via the canonical ReasoningEffort slot (outbound re-emits flat).
+func TestInboundTransformer_UnknownReasoningEffortObjectRoundTripChat(t *testing.T) {
+	const futureEffort = "future-effort"
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"o3","messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"` + futureEffort + `"}}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+	require.Equal(t, futureEffort, llmReq.ReasoningEffort, "unknown reasoning.effort object must be captured verbatim")
+
+	outReq := RequestFromLLM(llmReq, ReasoningFieldNone)
+	require.Equal(t, futureEffort, outReq.ReasoningEffort)
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-key")
+	require.NoError(t, err)
+	upstreamReq, err := outbound.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var outboundBody map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(upstreamReq.Body, &outboundBody))
+	require.Contains(t, outboundBody, "reasoning_effort")
+	var effort string
+	require.NoError(t, json.Unmarshal(outboundBody["reasoning_effort"], &effort))
+	require.Equal(t, futureEffort, effort, "unknown object effort must re-emit as flat reasoning_effort unchanged")
+}
+
+// CHAT.TOP.modalities: Chat same-protocol field-level round-trip.
+// Responses/Gemini modality tests are not sufficient evidence for this row.
+func TestInboundTransformer_TransformRequest_ModalitiesRoundTripChat(t *testing.T) {
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"modalities":["text","audio"]}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+	require.Equal(t, []string{"text", "audio"}, llmReq.Modalities)
+
+	outReq := RequestFromLLM(llmReq, ReasoningFieldNone)
+	require.Equal(t, []string{"text", "audio"}, outReq.Modalities, "Chat modalities must survive chat→canonical→chat round-trip")
+
+	// Full outbound wire path: typed field must be present on the JSON body.
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-key")
+	require.NoError(t, err)
+	upstreamReq, err := outbound.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var outboundBody map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(upstreamReq.Body, &outboundBody))
+	require.JSONEq(t, `["text","audio"]`, string(outboundBody["modalities"]))
+}
+
+func TestInboundTransformer_TransformRequest_ModalitiesOmittedChat(t *testing.T) {
+	inbound := NewInboundTransformer()
+	chatReq := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/chat/completions",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+	require.Empty(t, llmReq.Modalities)
+
+	outReq := RequestFromLLM(llmReq, ReasoningFieldNone)
+	require.Empty(t, outReq.Modalities)
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-key")
+	require.NoError(t, err)
+	upstreamReq, err := outbound.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var outboundBody map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(upstreamReq.Body, &outboundBody))
+	_, has := outboundBody["modalities"]
+	require.False(t, has, "omitted modalities must not be synthesized")
+}

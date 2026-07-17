@@ -199,6 +199,8 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 					"tools": [
 						{
 							"type": "image_generation",
+							"model": "gpt-image-1",
+							"input_image_mask": {"image_url": "mask.png"},
 							"quality": "high",
 							"size": "1024x1024"
 						}
@@ -210,6 +212,8 @@ func TestInboundTransformer_TransformRequest(t *testing.T) {
 				require.Len(t, result.Tools, 1)
 				require.Equal(t, llm.ToolTypeImageGeneration, result.Tools[0].Type)
 				require.NotNil(t, result.Tools[0].ImageGeneration)
+				require.Equal(t, "gpt-image-1", result.Tools[0].ImageGeneration.Model)
+				require.Equal(t, map[string]any{"image_url": "mask.png"}, result.Tools[0].ImageGeneration.InputImageMask)
 				require.Equal(t, "high", result.Tools[0].ImageGeneration.Quality)
 				require.Equal(t, "1024x1024", result.Tools[0].ImageGeneration.Size)
 			},
@@ -974,6 +978,52 @@ func TestConvertItemToMessage_Compaction(t *testing.T) {
 	}
 }
 
+func TestConvertItemToMessage_InputAudio(t *testing.T) {
+	tests := []struct {
+		name     string
+		item     *Item
+		validate func(t *testing.T, result *llm.Message, err error)
+	}{
+		{
+			name: "standalone input_audio item",
+			item: &Item{
+				Type: "input_audio",
+				InputAudio: &llm.InputAudio{
+					Data:   "audio-base64-data",
+					Format: "wav",
+				},
+			},
+			validate: func(t *testing.T, result *llm.Message, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				require.Equal(t, "user", result.Role)
+				require.Len(t, result.Content.MultipleContent, 1)
+				require.Equal(t, "input_audio", result.Content.MultipleContent[0].Type)
+				require.NotNil(t, result.Content.MultipleContent[0].InputAudio)
+				require.Equal(t, "audio-base64-data", result.Content.MultipleContent[0].InputAudio.Data)
+				require.Equal(t, "wav", result.Content.MultipleContent[0].InputAudio.Format)
+			},
+		},
+		{
+			name: "input_audio item with nil InputAudio",
+			item: &Item{
+				Type: "input_audio",
+			},
+			validate: func(t *testing.T, result *llm.Message, err error) {
+				require.NoError(t, err)
+				require.Nil(t, result)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := convertItemToMessage(tt.item)
+			tt.validate(t, result, err)
+		})
+	}
+}
+
 func TestConvertContentItemToPart_Compaction(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -1698,6 +1748,38 @@ func TestConvertReasoningWithFollowing(t *testing.T) {
 	}
 }
 
+func TestConvertInputToMessages_GroupsConsecutiveParallelFunctionCalls(t *testing.T) {
+	items := []Item{
+		{Type: "function_call", ID: "item_call_1", CallID: "call_1", Name: "first", Arguments: `{}`},
+		{Type: "function_call", ID: "item_call_2", CallID: "call_2", Name: "second", Arguments: `{}`},
+		{Type: "function_call", ID: "item_call_3", CallID: "call_3", Name: "third", Arguments: `{}`},
+		{Type: "function_call", ID: "item_call_4", CallID: "call_4", Name: "fourth", Arguments: `{}`},
+		{Type: "function_call_output", CallID: "call_1", Output: &Input{Text: lo.ToPtr("output 1")}},
+		{Type: "function_call_output", CallID: "call_2", Output: &Input{Text: lo.ToPtr("output 2")}},
+		{Type: "function_call_output", CallID: "call_3", Output: &Input{Text: lo.ToPtr("output 3")}},
+		{Type: "function_call_output", CallID: "call_4", Output: &Input{Text: lo.ToPtr("output 4")}},
+	}
+
+	messages, err := convertInputToMessages(&Input{Items: items})
+	require.NoError(t, err)
+	require.Len(t, messages, 5)
+	require.Equal(t, "assistant", messages[0].Role)
+	require.Len(t, messages[0].ToolCalls, 4)
+	require.Equal(t, []string{"call_1", "call_2", "call_3", "call_4"}, []string{
+		messages[0].ToolCalls[0].ID,
+		messages[0].ToolCalls[1].ID,
+		messages[0].ToolCalls[2].ID,
+		messages[0].ToolCalls[3].ID,
+	})
+
+	for index, callID := range []string{"call_1", "call_2", "call_3", "call_4"} {
+		message := messages[index+1]
+		require.Equal(t, "tool", message.Role)
+		require.NotNil(t, message.ToolCallID)
+		require.Equal(t, callID, *message.ToolCallID)
+	}
+}
+
 func TestInboundTransformer_TransformRequest_WithReasoningInput(t *testing.T) {
 	trans := NewInboundTransformer()
 
@@ -1925,4 +2007,398 @@ func TestInboundTransformer_TransformResponse_WithReasoningContent(t *testing.T)
 			}
 		})
 	}
+}
+
+// TestConvertToResponsesAPIResponse_ServiceTierAndError covers #21:
+// convertToResponsesAPIResponse must backfill service_tier and error from
+// the canonical Response.
+func TestConvertToResponsesAPIResponse_ServiceTierAndError(t *testing.T) {
+	t.Run("service_tier backfilled", func(t *testing.T) {
+		resp := convertToResponsesAPIResponse(&llm.Response{
+			ID:          "resp_st",
+			Model:       "gpt-4o",
+			ServiceTier: "priority",
+		})
+		require.NotNil(t, resp.ServiceTier)
+		require.Equal(t, "priority", *resp.ServiceTier)
+	})
+
+	t.Run("error backfilled", func(t *testing.T) {
+		resp := convertToResponsesAPIResponse(&llm.Response{
+			ID:    "resp_err",
+			Model: "gpt-4o",
+			Error: &llm.ResponseError{
+				StatusCode: 400,
+				Detail: llm.ErrorDetail{
+					Type:    "invalid_request_error",
+					Code:    "bad_value",
+					Message: "model not found",
+				},
+			},
+		})
+		require.NotNil(t, resp.Error)
+		require.Equal(t, "invalid_request_error", resp.Error.Type)
+		require.Equal(t, "bad_value", resp.Error.Code)
+		require.Equal(t, "model not found", resp.Error.Message)
+	})
+
+	t.Run("nil service_tier and error stay absent", func(t *testing.T) {
+		resp := convertToResponsesAPIResponse(&llm.Response{
+			ID:    "resp_plain",
+			Model: "gpt-4o",
+		})
+		require.Nil(t, resp.ServiceTier)
+		require.Nil(t, resp.Error)
+	})
+}
+
+// TestConvertContentItemToPart_InputAudio covers #5: Responses inbound must
+// convert input_audio content items into canonical MessageContentPart.
+func TestConvertContentItemToPart_InputAudio(t *testing.T) {
+	item := &Item{
+		ID:   "audio_part_1",
+		Type: "input_audio",
+		InputAudio: &llm.InputAudio{
+			Format: "mp3",
+			Data:   "SGVsbG8gV29ybGQ=",
+		},
+	}
+
+	result, err := convertContentItemToPart(item)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "input_audio", result.Type)
+	require.Equal(t, "audio_part_1", result.ID)
+	require.NotNil(t, result.InputAudio)
+	require.Equal(t, "mp3", result.InputAudio.Format)
+	require.Equal(t, "SGVsbG8gV29ybGQ=", result.InputAudio.Data)
+}
+
+func TestConvertReasoningWithFollowing_CustomToolCallPreservesNamespace(t *testing.T) {
+	items := []Item{
+		{ID: "r_ns", Type: "reasoning", Summary: []ReasoningSummary{{Type: "summary_text", Text: "think"}}},
+		{ID: "c_ns", Type: "custom_tool_call", CallID: "call_ns_1", Name: "apply_patch", Namespace: "mcp__myserver", Input: lo.ToPtr("patch")},
+	}
+	msg, _, err := convertReasoningWithFollowing(items, 0)
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+	require.NotEmpty(t, msg.ToolCalls)
+	var got string
+	for _, tc := range msg.ToolCalls {
+		if tc.ResponseCustomToolCall != nil {
+			got = tc.ResponseCustomToolCall.Namespace
+		}
+	}
+	require.Equal(t, "mcp__myserver", got, "D11(i): look-ahead merge must preserve custom_tool_call namespace")
+}
+
+func TestConvertItemToMessage_CustomToolCallPreservesNamespace(t *testing.T) {
+	item := &Item{ID: "c_ns2", Type: "custom_tool_call", CallID: "call_ns_2", Name: "apply_patch", Namespace: "mcp__myserver", Input: lo.ToPtr("patch")}
+	msg, err := convertItemToMessage(item)
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+	require.NotEmpty(t, msg.ToolCalls)
+	require.NotNil(t, msg.ToolCalls[0].ResponseCustomToolCall)
+	require.Equal(t, "mcp__myserver", msg.ToolCalls[0].ResponseCustomToolCall.Namespace, "D11(ii): convertItemToMessage must preserve custom_tool_call namespace")
+}
+
+// C3/D23: responses top_k must survive responses→canonical→responses round-trip.
+func TestInboundTransformer_TransformRequest_TopKRoundTripResponses(t *testing.T) {
+	inbound := NewInboundTransformer()
+	req := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/responses",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"gpt-4o","input":"hi","top_k":40}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-key")
+	require.NoError(t, err)
+
+	result, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var respReq Request
+	require.NoError(t, json.Unmarshal(result.Body, &respReq))
+	require.NotNil(t, respReq.TopK, "C3: responses top_k must survive responses round-trip")
+	require.Equal(t, int64(40), *respReq.TopK)
+}
+
+// #4/D20: responses reasoning.enabled must be captured into TransformerMetadata
+// (canonical has no Enabled slot). Without this the toggle is dropped on
+// cross-format conversion.
+func TestInboundTransformer_TransformRequest_ReasoningEnabledCaptured(t *testing.T) {
+	inbound := NewInboundTransformer()
+	req := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/responses",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"o3","input":"hi","reasoning":{"effort":"high","enabled":true}}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "high", llmReq.ReasoningEffort)
+	v, ok := llmReq.TransformerMetadata[responsesReasoningEnabledTransformerMetadataKey]
+	require.True(t, ok, "#4: reasoning.enabled must be stashed into metadata")
+	b, ok := v.(*bool)
+	require.True(t, ok, "#4: stashed value must be *bool")
+	require.True(t, *b, "#4: reasoning.enabled=true must survive")
+}
+
+// #4/D20: responses reasoning.enabled survives responses→canonical→responses
+// round-trip (outbound convertReasoning restores it).
+func TestInboundTransformer_TransformRequest_ReasoningEnabledRoundTrip(t *testing.T) {
+	inbound := NewInboundTransformer()
+	req := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/responses",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"o3","input":"hi","reasoning":{"enabled":false}}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-key")
+	require.NoError(t, err)
+
+	result, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+
+	var respReq Request
+	require.NoError(t, json.Unmarshal(result.Body, &respReq))
+	require.NotNil(t, respReq.Reasoning, "#4: reasoning object must be emitted even when only enabled is set")
+	require.NotNil(t, respReq.Reasoning.Enabled, "#4: reasoning.enabled must survive round-trip")
+	require.False(t, *respReq.Reasoning.Enabled, "#4: reasoning.enabled=false must survive round-trip")
+}
+
+// #4/D20: default guard — no reasoning means convertReasoning returns nil and no
+// metadata is stashed.
+func TestInboundTransformer_TransformRequest_ReasoningEnabledDefaultGuard(t *testing.T) {
+	inbound := NewInboundTransformer()
+	req := &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    "/v1/responses",
+		Headers: http.Header{
+			"Content-Type": []string{"application/json"},
+		},
+		Body: []byte(`{"model":"gpt-4o","input":"hi"}`),
+	}
+
+	llmReq, err := inbound.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	_, ok := llmReq.TransformerMetadata[responsesReasoningEnabledTransformerMetadataKey]
+	require.False(t, ok, "#4: no reasoning.enabled must not stash metadata")
+
+	outbound, err := NewOutboundTransformer("https://api.openai.com", "test-key")
+	require.NoError(t, err)
+	result, err := outbound.TransformRequest(context.Background(), llmReq)
+	require.NoError(t, err)
+	var respReq Request
+	require.NoError(t, json.Unmarshal(result.Body, &respReq))
+	require.Nil(t, respReq.Reasoning, "#4: no reasoning must yield nil Reasoning")
+}
+
+// TestConvertToLLMRequest_NamespaceToolMapRecorded covers #1a/D1: when a
+// namespace tool group (e.g. mcp__node_repl{run}) is declared, the inbound
+// converter must record a compositeName→{leaf,namespace} map in
+// TransformerMetadata so the outbound side can restore the group identity
+// without string splitting (group names may themselves contain "__").
+func TestConvertToLLMRequest_NamespaceToolMapRecorded(t *testing.T) {
+	req := &Request{
+		Model: "gpt-4o",
+		Input: Input{Text: lo.ToPtr("use the tool")},
+		Tools: []Tool{
+			{
+				Type:        "namespace",
+				Name:        "mcp__node_repl",
+				Description: "Tools in the mcp__node_repl namespace.",
+				Tools: []Tool{
+					{Type: "function", Name: "run", Description: "Run JavaScript", Parameters: map[string]any{"type": "object"}},
+				},
+			},
+		},
+	}
+
+	result, err := convertToLLMRequest(req)
+	require.NoError(t, err)
+
+	raw, ok := result.TransformerMetadata[responsesNamespaceToolMapTransformerMetadataKey]
+	require.True(t, ok, "namespace tool map must be recorded in TransformerMetadata")
+
+	m, ok := raw.(map[string]namespaceToolEntry)
+	require.True(t, ok, "namespace tool map must be map[string]namespaceToolEntry")
+
+	entry, ok := m["mcp__node_repl__run"]
+	require.True(t, ok, "composite name mcp__node_repl__run must be in the map")
+	require.Equal(t, "run", entry.Leaf)
+	require.Equal(t, "mcp__node_repl", entry.Namespace)
+
+	// The flattened function must also be in the tools list.
+	require.Len(t, result.Tools, 1)
+	require.Equal(t, "mcp__node_repl__run", result.Tools[0].Function.Name)
+	require.Equal(t, "Tools in the mcp__node_repl namespace.\n\nRun JavaScript", result.Tools[0].Function.Description)
+}
+
+// TestConvertToResponsesAPIResponse_NamespaceFunctionCallRestored covers #1a/D1:
+// when the model returns a function_call with the flattened composite name
+// (e.g. mcp__node_repl__run), the non-streaming response converter must look up
+// the namespace tool map in TransformerMetadata and restore {name:run,
+// namespace:mcp__node_repl}. Group names containing "__" must never be split.
+func TestConvertToResponsesAPIResponse_NamespaceFunctionCallRestored(t *testing.T) {
+	nsMap := map[string]namespaceToolEntry{
+		"mcp__node_repl__run": {Leaf: "run", Namespace: "mcp__node_repl"},
+	}
+	chatResp := &llm.Response{
+		ID:    "resp_ns",
+		Model: "gpt-4o",
+		Choices: []llm.Choice{
+			{
+				Index: 0,
+				Message: &llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{
+						{
+							ID:   "call_1",
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "mcp__node_repl__run",
+								Arguments: `{"x":1}`,
+							},
+						},
+					},
+				},
+			},
+		},
+		TransformerMetadata: map[string]any{
+			responsesNamespaceToolMapTransformerMetadataKey: nsMap,
+		},
+	}
+
+	resp := convertToResponsesAPIResponse(chatResp)
+
+	var fcItem *Item
+	for i := range resp.Output {
+		if resp.Output[i].Type == "function_call" {
+			fcItem = &resp.Output[i]
+			break
+		}
+	}
+	require.NotNil(t, fcItem, "function_call item must exist")
+	require.Equal(t, "run", fcItem.Name, "name must be restored to leaf")
+	require.Equal(t, "mcp__node_repl", fcItem.Namespace, "namespace must be restored to group")
+}
+
+// TestConvertToResponsesAPIResponse_FlatFunctionCallUnchanged ensures flat
+// (non-namespace) tools are not affected: no map entry → keep original name,
+// empty namespace. Regression guard.
+func TestConvertToResponsesAPIResponse_FlatFunctionCallUnchanged(t *testing.T) {
+	chatResp := &llm.Response{
+		ID:    "resp_flat",
+		Model: "gpt-4o",
+		Choices: []llm.Choice{
+			{
+				Index: 0,
+				Message: &llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{
+						{
+							ID:   "call_1",
+							Type: "function",
+							Function: llm.FunctionCall{
+								Name:      "get_weather",
+								Arguments: `{"city":"SF"}`,
+							},
+						},
+					},
+				},
+			},
+		},
+		TransformerMetadata: map[string]any{},
+	}
+
+	resp := convertToResponsesAPIResponse(chatResp)
+
+	var fcItem *Item
+	for i := range resp.Output {
+		if resp.Output[i].Type == "function_call" {
+			fcItem = &resp.Output[i]
+			break
+		}
+	}
+	require.NotNil(t, fcItem)
+	require.Equal(t, "get_weather", fcItem.Name)
+	require.Equal(t, "", fcItem.Namespace)
+}
+
+func TestConvertInputToMessages_MergesReasoningBetweenFunctionCallAndOutput(t *testing.T) {
+	items := []Item{
+		{Type: "function_call", ID: "fc_1", CallID: "call_1dfb1152-5e5c-4aa1-ad30-8aeb7d62d670", Name: "exec_command", Arguments: `{"cmd":"echo hi"}`},
+		{
+			Type: "reasoning",
+			ID:   "rs_mid",
+			Summary: []ReasoningSummary{{
+				Type: "summary_text",
+				Text: "...\n",
+			}},
+		},
+		{Type: "function_call_output", CallID: "call_1dfb1152-5e5c-4aa1-ad30-8aeb7d62d670", Output: &Input{Text: lo.ToPtr("tool result")}},
+	}
+
+	messages, err := convertInputToMessages(&Input{Items: items})
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+
+	// assistant(tool_calls + reasoning) then immediate tool output.
+	require.Equal(t, "assistant", messages[0].Role)
+	require.Len(t, messages[0].ToolCalls, 1)
+	require.Equal(t, "call_1dfb1152-5e5c-4aa1-ad30-8aeb7d62d670", messages[0].ToolCalls[0].ID)
+	require.Equal(t, "exec_command", messages[0].ToolCalls[0].Function.Name)
+	require.NotNil(t, messages[0].ReasoningContent)
+	require.Equal(t, "...\n", *messages[0].ReasoningContent)
+	require.NotNil(t, messages[0].ResponseReasoningItemID)
+	require.Equal(t, "rs_mid", *messages[0].ResponseReasoningItemID)
+
+	require.Equal(t, "tool", messages[1].Role)
+	require.NotNil(t, messages[1].ToolCallID)
+	require.Equal(t, "call_1dfb1152-5e5c-4aa1-ad30-8aeb7d62d670", *messages[1].ToolCallID)
+	require.NotNil(t, messages[1].Content.Content)
+	require.Equal(t, "tool result", *messages[1].Content.Content)
+}
+
+func TestConvertInputToMessages_MergesReasoningBetweenCustomToolCallAndOutput(t *testing.T) {
+	inputText := "SELECT 1"
+	items := []Item{
+		{Type: "custom_tool_call", ID: "ctc_1", CallID: "call_custom_1", Name: "exec", Input: &inputText},
+		{
+			Type: "reasoning",
+			ID:   "rs_custom_mid",
+			Summary: []ReasoningSummary{{
+				Type: "summary_text",
+				Text: "checking result shape",
+			}},
+		},
+		{Type: "custom_tool_call_output", CallID: "call_custom_1", Output: &Input{Text: lo.ToPtr("ok")}},
+	}
+
+	messages, err := convertInputToMessages(&Input{Items: items})
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Equal(t, "assistant", messages[0].Role)
+	require.Len(t, messages[0].ToolCalls, 1)
+	require.Equal(t, "call_custom_1", messages[0].ToolCalls[0].ID)
+	require.NotNil(t, messages[0].ReasoningContent)
+	require.Equal(t, "checking result shape", *messages[0].ReasoningContent)
+	require.Equal(t, "tool", messages[1].Role)
+	require.Equal(t, "call_custom_1", *messages[1].ToolCallID)
 }

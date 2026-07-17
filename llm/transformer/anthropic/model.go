@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/samber/lo"
+
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // MessageRequest represents the Anthropic Messages API request format.
@@ -100,6 +102,28 @@ type MessageRequest struct {
 	// When this field is set, AxonHub preserves it as-is and skips its own
 	// per-block cache_control breakpoint optimization pipeline.
 	CacheControl *CacheControl `json:"cache_control,omitempty"`
+
+	// ContextManagement is an optional context-management configuration
+	// (edits: clear_tool_uses / clear_thinking, etc.). Kept as json.RawMessage
+	// so it round-trips to the upstream Anthropic API without the proxy
+	// modeling the versioned, discriminated edits schema (mirrors the Caller /
+	// tool_result json.RawMessage passthrough). canonical llm.Request has no
+	// equivalent, so it is carried through TransformerMetadata.
+	ContextManagement json.RawMessage `json:"context_management,omitempty"`
+
+	// Container is an Anthropic-native top-level object. Keep as json.RawMessage so
+	// same-protocol replay preserves unknown nested keys without modeling the
+	// versioned internal shape on llm.Request.
+	Container json.RawMessage `json:"container,omitempty"`
+
+	// InferenceGeo is an Anthropic-native top-level geography selector/observation.
+	// Preserve raw JSON values, including future unknown strings/objects.
+	InferenceGeo json.RawMessage `json:"inference_geo,omitempty"`
+
+	// MCPServers is the Anthropic MCP connector companion field. Keep as opaque
+	// json.RawMessage so same-protocol replay preserves auth/config and unknown
+	// nested keys. This is not equivalent to OpenAI Responses `mcp` tools.
+	MCPServers json.RawMessage `json:"mcp_servers,omitempty"`
 }
 
 type AnthropicMetadata struct {
@@ -157,6 +181,14 @@ const TransformerMetadataKeyThinkingType = "thinking_type"
 // TransformerMetadataKeyOutputConfigEffort is the key for storing output config effort in TransformerMetadata.
 const TransformerMetadataKeyOutputConfigEffort = "output_config_effort"
 
+// TransformerMetadataKeyOutputConfig is the key for storing the full Anthropic
+// output_config (carrying effort + format + task_budget) so the Anthropic
+// outbound can restore it verbatim when the upstream supports output_config.
+// The value is *OutputConfig. Effort is ALSO mirrored under
+// TransformerMetadataKeyOutputConfigEffort for the cross-format reasoning_effort
+// mapping and the non-output_config thinking fallback.
+const TransformerMetadataKeyOutputConfig = "anthropic_output_config"
+
 // TransformerMetadataKeyThinkingDisplay is the key for storing thinking display in TransformerMetadata.
 const TransformerMetadataKeyThinkingDisplay = "thinking_display"
 
@@ -166,12 +198,43 @@ const TransformerMetadataKeyThinkingDisplay = "thinking_display"
 // Anthropic outbound transformer restores it onto the upstream request
 // untouched and skips its own breakpoint optimization pipeline so that
 // Anthropic's automatic caching behavior is preserved.
-const TransformerMetadataKeyCacheControl = "anthropic_cache_control"
+const TransformerMetadataKeyCacheControl = shared.TransformerMetadataKeyCacheControl
 
-// TransformerMetadataKeyAnthropicResponseContent stores provider-native Anthropic response content blocks
-// so outbound->unified->inbound round-trip can restore Anthropic-only blocks such as
-// server_tool_use and web_search_tool_result without expanding the unified llm schema.
-const TransformerMetadataKeyAnthropicResponseContent = "anthropic_response_content"
+// TransformerMetadataKeyContextManagement is the key for storing the top-level
+// context_management (Anthropic context-compression strategy, edits[]) carried
+// by an Anthropic-format inbound request. The value is json.RawMessage (opaque
+// passthrough). The Anthropic outbound transformer restores it onto the upstream
+// request untouched so the client's context-management strategy is preserved.
+const TransformerMetadataKeyContextManagement = "anthropic_context_management"
+
+// TransformerMetadataKeyContainer stores Anthropic top-level container as opaque JSON.
+const TransformerMetadataKeyContainer = "anthropic_container"
+
+// TransformerMetadataKeyInferenceGeo stores Anthropic top-level inference_geo as opaque JSON.
+const TransformerMetadataKeyInferenceGeo = "anthropic_inference_geo"
+
+// TransformerMetadataKeyMCPServers stores Anthropic top-level mcp_servers as opaque JSON.
+const TransformerMetadataKeyMCPServers = "anthropic_mcp_servers"
+
+// TransformerMetadataKeyRawTools stores ordered Anthropic adapter-specific tool
+// wire fragments (mcp_toolset, non-web-search native tools, and same-protocol
+// function-tool declarations with Anthropic-only children) that must not be
+// flattened into llm.Tool.
+const TransformerMetadataKeyRawTools = "anthropic_raw_tools"
+
+// TransformerMetadataKeyAnthropicStopSequence stores the matched response
+// stop_sequence string for same-protocol replay.
+const TransformerMetadataKeyAnthropicStopSequence = "anthropic_stop_sequence"
+
+// TransformerMetadataKeyAnthropicStopReason stores the original Anthropic
+// stop_reason (e.g. "stop_sequence") so an Anthropic->canonical->Anthropic
+// round-trip restores it instead of collapsing to "end_turn".
+const TransformerMetadataKeyAnthropicStopReason = "anthropic_stop_reason"
+
+// transformerMetadataKeyTopKLegacy is the legacy Anthropic-specific key for top_k.
+// Kept for backward-compatible reading of persisted TransformerMetadata; new writes
+// use the shared neutral key shared.TransformerMetadataKeyTopK ("top_k").
+const transformerMetadataKeyTopKLegacy = "anthropic_top_k"
 
 type Thinking struct {
 	Type         string `json:"type"          validate:"required,oneof=enabled disabled adaptive"`
@@ -187,6 +250,17 @@ type OutputConfig struct {
 	// Any of "low", "medium", "high", "max".
 	// "max" is only supported by claude-opus-4-6.
 	Effort string `json:"effort,omitempty" validate:"omitempty,oneof=low medium high max"`
+
+	// Format specifies a structured-output schema (json_schema) for the response.
+	// Anthropic-only; carried through TransformerMetadata and restored verbatim
+	// when the upstream supports output_config. Kept as json.RawMessage (opaque)
+	// since the gateway does not interpret the schema.
+	Format json.RawMessage `json:"format,omitempty"`
+
+	// TaskBudget is an advisory agentic-turn token budget the model counts down.
+	// Anthropic-only; carried through TransformerMetadata and restored verbatim
+	// when the upstream supports output_config.
+	TaskBudget json.RawMessage `json:"task_budget,omitempty"`
 }
 
 type ToolChoice struct {
@@ -224,6 +298,11 @@ type Tool struct {
 	// UserLocation Parameters for the user's location. Used to provide more relevant search
 	// results.
 	UserLocation WebSearchToolUserLocation `json:"user_location,omitzero"`
+
+	// Raw holds the original tool JSON for adapter-specific variants that must not
+	// be modeled as common llm.Tool (e.g. type=mcp_toolset). When set, MarshalJSON
+	// emits Raw verbatim.
+	Raw json.RawMessage `json:"-"`
 }
 
 type WebSearchToolUserLocation struct {
@@ -350,6 +429,7 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 // MessageContentBlock represents different types of content blocks.
 type MessageContentBlock struct {
 	// Any of "text", "image", "thinking", "redacted_thinking", "tool_use", "server_tool_use", "tool_result".
+	// Unknown/future block types are preserved via Raw for same-protocol replay.
 	Type string `json:"type"`
 
 	// Text will be present if type is "text".
@@ -394,6 +474,11 @@ type MessageContentBlock struct {
 	// *_tool_result). It is kept as json.RawMessage to avoid version-matrix
 	// churn (direct / code_execution_20250825 / code_execution_20260120 / ...).
 	Caller json.RawMessage `json:"caller,omitempty"`
+
+	// Raw holds the original content-block JSON for unknown/future variants or
+	// when typed fields cannot losslessly represent the wire shape. When set for
+	// an unknown block type, MarshalJSON emits Raw verbatim.
+	Raw json.RawMessage `json:"-"`
 }
 
 // TextCitation represents a citation attached to an Anthropic text block.
@@ -404,9 +489,47 @@ type TextCitation struct {
 
 	EncryptedIndex *string `json:"encrypted_index,omitempty"`
 	CitedText      *string `json:"cited_text,omitempty"`
+
+	// Raw retains Anthropic-native and future citation children for same-family
+	// response replay. Generated cross-protocol citations leave Raw empty.
+	Raw json.RawMessage `json:"-"`
+}
+
+func (c *TextCitation) UnmarshalJSON(data []byte) error {
+	type citationAlias TextCitation
+	var decoded citationAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = TextCitation(decoded)
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err == nil {
+		for key := range fields {
+			switch key {
+			case "type", "url", "title", "encrypted_index", "cited_text":
+			default:
+				c.Raw = append(json.RawMessage(nil), data...)
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (c TextCitation) MarshalJSON() ([]byte, error) {
+	if len(c.Raw) > 0 {
+		return c.Raw, nil
+	}
+	type citationAlias TextCitation
+	return json.Marshal(citationAlias(c))
 }
 
 func (b MessageContentBlock) MarshalJSON() ([]byte, error) {
+	if len(b.Raw) > 0 && !isKnownAnthropicContentBlockType(b.Type) {
+		return b.Raw, nil
+	}
+
 	type blockAlias MessageContentBlock
 
 	if b.Type == "thinking" {
@@ -425,6 +548,96 @@ func (b MessageContentBlock) MarshalJSON() ([]byte, error) {
 	}
 
 	return json.Marshal(blockAlias(b))
+}
+
+// UnmarshalJSON tolerates unknown block shapes (e.g. search_result with a string
+// "source") while still decoding known typed fields best-effort. The original
+// bytes are retained in Raw for unknown/future block types.
+func (b *MessageContentBlock) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+
+	// Flexible intermediate: Source may be an ImageSource object or a non-object
+	// value on unknown blocks. Nested Content still uses MessageContent.
+	var aux struct {
+		Text             *string         `json:"text"`
+		Citations        []TextCitation  `json:"citations"`
+		Thinking         *string         `json:"thinking"`
+		Signature        *string         `json:"signature"`
+		Data             string          `json:"data"`
+		Source           json.RawMessage `json:"source"`
+		ID               string          `json:"id"`
+		Name             *string         `json:"name"`
+		Input            json.RawMessage `json:"input"`
+		CacheControl     *CacheControl   `json:"cache_control"`
+		ToolUseID        *string         `json:"tool_use_id"`
+		Content          *MessageContent `json:"content"`
+		IsError          *bool           `json:"is_error"`
+		URL              string          `json:"url"`
+		Title            string          `json:"title"`
+		EncryptedContent *string         `json:"encrypted_content"`
+		PageAge          *string         `json:"page_age"`
+		Caller           json.RawMessage `json:"caller"`
+	}
+	// Best-effort typed decode; never fail the whole request for unknown shapes.
+	_ = json.Unmarshal(data, &aux)
+
+	b.Type = probe.Type
+	b.Text = aux.Text
+	b.Citations = aux.Citations
+	b.Thinking = aux.Thinking
+	b.Signature = aux.Signature
+	b.Data = aux.Data
+	b.ID = aux.ID
+	b.Name = aux.Name
+	b.Input = aux.Input
+	b.CacheControl = aux.CacheControl
+	b.ToolUseID = aux.ToolUseID
+	b.Content = aux.Content
+	b.IsError = aux.IsError
+	b.URL = aux.URL
+	b.Title = aux.Title
+	b.EncryptedContent = aux.EncryptedContent
+	b.PageAge = aux.PageAge
+	b.Caller = aux.Caller
+
+	if len(aux.Source) > 0 && string(aux.Source) != "null" {
+		var src ImageSource
+		if err := json.Unmarshal(aux.Source, &src); err == nil {
+			if src.Type != "" || src.URL != "" || src.Data != "" || src.MediaType != "" {
+				b.Source = &src
+			}
+		}
+	}
+
+	// Keep raw bytes for unknown/future blocks so MarshalJSON can emit them
+	// verbatim. Known blocks use typed fields.
+	if !isKnownAnthropicContentBlockType(b.Type) {
+		b.Raw = append(json.RawMessage(nil), data...)
+	}
+
+	return nil
+}
+
+func isKnownAnthropicContentBlockType(blockType string) bool {
+	switch blockType {
+	case "text", "image", "document", "thinking", "redacted_thinking",
+		"tool_use", "tool_result", "server_tool_use":
+		return true
+	default:
+		if isAnthropicSpecialToolUseBlock(blockType) || isAnthropicSpecialToolResultBlock(blockType) {
+			return true
+		}
+		return false
+	}
 }
 
 // ImageSource represents image source for Anthropic.
@@ -540,7 +753,10 @@ type Message struct {
 	// This value will be a non-null string if one of your custom stop sequences was
 	// generated.
 	StopSequence *string `json:"stop_sequence,omitempty"`
-	Usage        *Usage  `json:"usage,omitempty"`
+	// StopDetails is an Anthropic-native structured stop detail object. Kept as
+	// opaque JSON so same-protocol replay preserves unknown nested keys.
+	StopDetails json.RawMessage `json:"stop_details,omitempty"`
+	Usage       *Usage          `json:"usage,omitempty"`
 }
 
 type ErrorDetail struct {

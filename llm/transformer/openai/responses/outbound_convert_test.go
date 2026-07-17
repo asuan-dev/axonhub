@@ -140,6 +140,10 @@ func TestConvertToolMessage(t *testing.T) {
 						Text: lo.ToPtr("Text result"),
 					},
 					{
+						Type:     "input_image",
+						ImageURL: lo.ToPtr("https://example.com/image.jpg"),
+					},
+					{
 						Type: "input_text",
 						Text: lo.ToPtr("More text"),
 					},
@@ -202,7 +206,19 @@ func TestConvertToolMessage(t *testing.T) {
 				Type:   "function_call_output",
 				CallID: "call_no_text",
 				Output: &Input{
-					Text: lo.ToPtr(""),
+					Items: []Item{
+						{
+							Type:     "input_image",
+							ImageURL: lo.ToPtr("https://example.com/image.jpg"),
+						},
+						{
+							Type:       "input_audio",
+							InputAudio: &llm.InputAudio{
+								Data:   "audio-data",
+								Format: "wav",
+							},
+						},
+					},
 				},
 			},
 		},
@@ -219,6 +235,40 @@ func TestConvertToolMessage(t *testing.T) {
 			require.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestConvertAssistantMessage_WithImage(t *testing.T) {
+	msgs := []llm.Message{
+		{
+			Role: "assistant",
+			Content: llm.MessageContent{
+				MultipleContent: []llm.MessageContentPart{
+					{
+						Type: "text",
+						Text: lo.ToPtr("here is the generated image"),
+					},
+					{
+						Type: "image_url",
+						ImageURL: &llm.ImageURL{
+							URL: "https://example.com/generated.png",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	result := convertInputFromMessages(msgs, llm.TransformOptions{ArrayInputs: lo.ToPtr(true)}, nil)
+	require.Len(t, result.Items, 1)
+	item := result.Items[0]
+	require.Equal(t, "message", item.Type)
+	require.Equal(t, "assistant", item.Role)
+	require.NotNil(t, item.Content)
+	require.Len(t, item.Content.Items, 2)
+	require.Equal(t, "output_text", item.Content.Items[0].Type)
+	require.Equal(t, "input_image", item.Content.Items[1].Type)
+	require.NotNil(t, item.Content.Items[1].ImageURL)
+	require.Equal(t, "https://example.com/generated.png", *item.Content.Items[1].ImageURL)
 }
 
 func TestConvertWebSearchToTool(t *testing.T) {
@@ -700,11 +750,77 @@ func TestConvertInputFromMessages(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "user message with input_audio",
+			msgs: []llm.Message{
+				{
+					Role: "user",
+					Content: llm.MessageContent{
+						MultipleContent: []llm.MessageContentPart{
+							{
+								Type: "input_audio",
+								InputAudio: &llm.InputAudio{
+									Data:   "audio-base64-data",
+									Format: "wav",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: Input{
+				Items: []Item{
+					{
+						Type: "message",
+						Role: "user",
+						Content: &Input{
+							Items: []Item{
+								{
+									Type: "input_audio",
+									InputAudio: &llm.InputAudio{
+										Data:   "audio-base64-data",
+										Format: "wav",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertInputFromMessages(tt.msgs, tt.transformOptions)
+			result := convertInputFromMessages(tt.msgs, tt.transformOptions, nil)
+			require.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestIsStructurallyRepresentedInputItem(t *testing.T) {
+	tests := []struct {
+		name     string
+		itemType string
+		expected bool
+	}{
+		{"empty", "", true},
+		{"message", "message", true},
+		{"input_text", "input_text", true},
+		{"input_image", "input_image", true},
+		{"input_audio", "input_audio", true},
+		{"function_call", "function_call", true},
+		{"function_call_output", "function_call_output", true},
+		{"reasoning", "reasoning", true},
+		{"compaction", "compaction", true},
+		{"unknown_type", "unknown_type", false},
+		{"file_search", "file_search", false},
+	}
+
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isStructurallyRepresentedInputItem(tt.itemType)
 			require.Equal(t, tt.expected, result)
 		})
 	}
@@ -748,14 +864,14 @@ func TestConvertReasoning(t *testing.T) {
 			},
 		},
 		{
-			name: "both effort and budget specified - effort takes priority",
+			name: "both effort and budget specified - effort wins per requirement",
 			req: &llm.Request{
 				ReasoningEffort: "medium",
 				ReasoningBudget: lo.ToPtr(int64(3000)),
 			},
 			expected: &Reasoning{
 				Effort:    "medium",
-				MaxTokens: nil, // Should be nil when effort is specified
+				MaxTokens: nil, // effort takes priority; max_tokens omitted to avoid mutually-exclusive fields
 			},
 		},
 		{
@@ -767,7 +883,7 @@ func TestConvertReasoning(t *testing.T) {
 			},
 			expected: &Reasoning{
 				Effort:    "high",
-				MaxTokens: nil, // effort takes priority
+				MaxTokens: nil, // effort present, so budget omitted per mutual-exclusion rule
 				Summary:   "detailed",
 			},
 		},
@@ -778,21 +894,6 @@ func TestConvertReasoning(t *testing.T) {
 			},
 			expected: &Reasoning{
 				Summary: "concise",
-			},
-		},
-		{
-			name: "with only responses reasoning context",
-			req: &llm.Request{
-				ProviderExtensions: &llm.ProviderExtensions{
-					OpenAIResponses: &llm.OpenAIResponsesProviderExtensions{
-						Request: &llm.OpenAIResponsesRequestExtensions{
-							ReasoningContext: "all_turns",
-						},
-					},
-				},
-			},
-			expected: &Reasoning{
-				Context: "all_turns",
 			},
 		},
 	}
@@ -1418,8 +1519,257 @@ func TestConvertAssistantMessage_WithCompactContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertAssistantMessage(tt.msg)
+			result := convertAssistantMessage(tt.msg, nil)
 			tt.validate(t, result)
 		})
 	}
+}
+
+// TestConvertToLLMRequest_SamplingPenalties covers #13: Responses inbound
+// must read frequency_penalty/presence_penalty from the request body.
+func TestConvertToLLMRequest_SamplingPenalties(t *testing.T) {
+	req := &Request{
+		Model:            "gpt-4o",
+		FrequencyPenalty: lo.ToPtr(0.5),
+		PresencePenalty:  lo.ToPtr(0.3),
+	}
+
+	result, err := convertToLLMRequest(req)
+	require.NoError(t, err)
+	require.NotNil(t, result.FrequencyPenalty)
+	require.Equal(t, 0.5, *result.FrequencyPenalty)
+	require.NotNil(t, result.PresencePenalty)
+	require.Equal(t, 0.3, *result.PresencePenalty)
+}
+
+// TestConvertToLLMRequest_Background covers #15: Responses inbound must
+// preserve the top-level background flag (background mode) via TransformerMetadata.
+func TestConvertToLLMRequest_Background(t *testing.T) {
+	t.Run("background true preserved", func(t *testing.T) {
+		req := &Request{
+			Model:      "gpt-4o",
+			Background: lo.ToPtr(true),
+		}
+
+		result, err := convertToLLMRequest(req)
+		require.NoError(t, err)
+		v, ok := result.TransformerMetadata["background"]
+		require.True(t, ok)
+		require.Equal(t, true, v)
+	})
+
+	t.Run("background absent stays absent", func(t *testing.T) {
+		req := &Request{
+			Model: "gpt-4o",
+		}
+
+		result, err := convertToLLMRequest(req)
+		require.NoError(t, err)
+		_, ok := result.TransformerMetadata["background"]
+		require.False(t, ok)
+	})
+}
+
+// TestConvertToLLMRequest_Modalities covers #14: Responses inbound must
+// read modalities from the request body into canonical.
+func TestConvertToLLMRequest_Modalities(t *testing.T) {
+	req := &Request{
+		Model:      "gpt-4o",
+		Modalities: []string{"text", "audio"},
+	}
+
+	result, err := convertToLLMRequest(req)
+	require.NoError(t, err)
+	require.Equal(t, []string{"text", "audio"}, result.Modalities)
+}
+
+// TestCustomToolCall_NamespaceRoundTrip covers #10: custom_tool_call must
+// carry namespace through canonical ResponseCustomToolCall on both the
+// inbound (outputItem -> ToolCall) and outbound (ToolCall -> Item) paths.
+func TestCustomToolCall_NamespaceRoundTrip(t *testing.T) {
+	t.Run("inbound preserves namespace", func(t *testing.T) {
+		outputItem := Item{
+			ID:        "ctc_ns",
+			Type:      "custom_tool_call",
+			CallID:    "call_ns_1",
+			Name:      "apply_patch",
+			Namespace: "mcp__myserver",
+			Input:     lo.ToPtr("*** Begin Patch\n*** End Patch"),
+			Status:    lo.ToPtr("completed"),
+		}
+
+		msg := convertOutputToMessage([]Item{outputItem}, nil)
+		require.Len(t, msg.ToolCalls, 1)
+		tc := msg.ToolCalls[0]
+		require.NotNil(t, tc.ResponseCustomToolCall)
+		require.Equal(t, "mcp__myserver", tc.ResponseCustomToolCall.Namespace)
+		require.Equal(t, "apply_patch", tc.ResponseCustomToolCall.Name)
+	})
+
+	t.Run("outbound preserves namespace", func(t *testing.T) {
+		chatResp := &llm.Response{
+			ID:    "resp_ns",
+			Model: "gpt-4o",
+			Choices: []llm.Choice{{
+				Message: &llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{{
+						ID:   "call_ns_2",
+						Type: llm.ToolTypeResponsesCustomTool,
+						ResponseCustomToolCall: &llm.ResponseCustomToolCall{
+							CallID:    "call_ns_2",
+							Name:      "apply_patch",
+							Namespace: "mcp__myserver",
+							Input:     "*** Begin Patch\n*** End Patch",
+						},
+					}},
+				},
+				FinishReason: lo.ToPtr("tool_calls"),
+			}},
+		}
+
+		resp := convertToResponsesAPIResponse(chatResp)
+		require.Len(t, resp.Output, 1)
+		item := resp.Output[0]
+		require.Equal(t, "custom_tool_call", item.Type)
+		require.Equal(t, "mcp__myserver", item.Namespace)
+		require.Equal(t, "apply_patch", item.Name)
+	})
+}
+
+// TestFunctionCallItem_IDAndStatusRoundTrip covers #19: function_call items
+// must preserve their item ID (distinct from call_id) and status across the
+// Responses inbound (outputItem -> ToolCall) and outbound (ToolCall -> Item)
+// conversion, instead of overwriting ID with call_id and hardcoding status.
+func TestFunctionCallItem_IDAndStatusRoundTrip(t *testing.T) {
+	t.Run("inbound preserves item id and status", func(t *testing.T) {
+		outputItem := Item{
+			ID:        "fc_item_1",
+			Type:      "function_call",
+			CallID:    "call_fc_1",
+			Name:      "get_weather",
+			Namespace: "",
+			Arguments: `{"city":"sf"}`,
+			Status:    lo.ToPtr("incomplete"),
+		}
+
+		msg := convertOutputToMessage([]Item{outputItem}, nil)
+		require.Len(t, msg.ToolCalls, 1)
+		tc := msg.ToolCalls[0]
+		require.Equal(t, "call_fc_1", tc.ID)
+		require.Equal(t, "fc_item_1", tc.ResponseItemID)
+		require.Equal(t, "incomplete", tc.Status)
+	})
+
+	t.Run("outbound restores item id and status", func(t *testing.T) {
+		chatResp := &llm.Response{
+			ID:    "resp_fc",
+			Model: "gpt-4o",
+			Choices: []llm.Choice{{
+				Message: &llm.Message{
+					Role: "assistant",
+					ToolCalls: []llm.ToolCall{{
+						ID:             "call_fc_2",
+						Type:           "function",
+						ResponseItemID: "fc_item_2",
+						Status:         "incomplete",
+						Function: llm.FunctionCall{
+							Name:      "get_weather",
+							Arguments: `{"city":"sf"}`,
+						},
+					}},
+				},
+				FinishReason: lo.ToPtr("tool_calls"),
+			}},
+		}
+
+		resp := convertToResponsesAPIResponse(chatResp)
+		require.Len(t, resp.Output, 1)
+		item := resp.Output[0]
+		require.Equal(t, "function_call", item.Type)
+		require.Equal(t, "fc_item_2", item.ID)
+		require.Equal(t, "call_fc_2", item.CallID)
+		require.NotNil(t, item.Status)
+		require.Equal(t, "incomplete", *item.Status)
+	})
+}
+
+func TestConvertAssistantMessage_CustomToolCallEmitsNamespace(t *testing.T) {
+	msg := llm.Message{
+		Role: "assistant",
+		ToolCalls: []llm.ToolCall{{
+			ID:   "call_ns_3",
+			Type: llm.ToolTypeResponsesCustomTool,
+			ResponseCustomToolCall: &llm.ResponseCustomToolCall{CallID: "call_ns_3", Name: "apply_patch", Namespace: "mcp__myserver", Input: "patch"},
+		}},
+	}
+	items := convertAssistantMessage(msg, nil)
+	var found bool
+	for _, it := range items {
+		if it.Type == "custom_tool_call" {
+			found = true
+			require.Equal(t, "mcp__myserver", it.Namespace, "D11(iii): convertAssistantMessage must emit custom_tool_call item with namespace")
+			require.Equal(t, "call_ns_3", it.CallID)
+		}
+	}
+	require.True(t, found, "expected a custom_tool_call item in output")
+}
+
+// TestConvertAssistantMessage_NamespaceFunctionCallRestored covers #1a/D1:
+// when building function_call Items from an assistant message whose tool call
+// carries a flattened composite name, convertAssistantMessage must look up the
+// namespace tool map in metadata and restore {name:leaf, namespace:group}.
+func TestConvertAssistantMessage_NamespaceFunctionCallRestored(t *testing.T) {
+	msg := llm.Message{
+		Role: "assistant",
+		ToolCalls: []llm.ToolCall{{
+			ID:   "call_ns_1",
+			Type: "function",
+			Function: llm.FunctionCall{
+				Name:      "mcp__node_repl__run",
+				Arguments: `{"x":1}`,
+			},
+		}},
+	}
+	metadata := map[string]any{
+		responsesNamespaceToolMapTransformerMetadataKey: map[string]namespaceToolEntry{
+			"mcp__node_repl__run": {Leaf: "run", Namespace: "mcp__node_repl"},
+		},
+	}
+	items := convertAssistantMessage(msg, metadata)
+	var found bool
+	for _, it := range items {
+		if it.Type == "function_call" {
+			found = true
+			require.Equal(t, "run", it.Name, "name must be restored to leaf")
+			require.Equal(t, "mcp__node_repl", it.Namespace, "namespace must be restored to group")
+		}
+	}
+	require.True(t, found, "expected a function_call item")
+}
+
+// TestConvertAssistantMessage_FlatFunctionCallUnchanged ensures flat tools
+// with no map entry keep their original name and empty namespace.
+func TestConvertAssistantMessage_FlatFunctionCallUnchanged(t *testing.T) {
+	msg := llm.Message{
+		Role: "assistant",
+		ToolCalls: []llm.ToolCall{{
+			ID:   "call_flat",
+			Type: "function",
+			Function: llm.FunctionCall{
+				Name:      "get_weather",
+				Arguments: `{}`,
+			},
+		}},
+	}
+	items := convertAssistantMessage(msg, nil)
+	var found bool
+	for _, it := range items {
+		if it.Type == "function_call" {
+			found = true
+			require.Equal(t, "get_weather", it.Name)
+			require.Equal(t, "", it.Namespace)
+		}
+	}
+	require.True(t, found)
 }

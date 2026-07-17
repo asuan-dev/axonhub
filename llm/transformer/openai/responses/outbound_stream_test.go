@@ -81,6 +81,9 @@ func TestOutboundTransformer_StreamTransformation_WithTestData(t *testing.T) {
 
 			// exclude the last DONE event
 			for i, expectedEvent := range expectedEvents[:len(expectedEvents)-1] {
+				// Stream fixtures predate Responses reasoning sidecars (item id/done,
+				// summary/content origin). Compare protocol payload, not sidecar map.
+				expectedEvent.TransformerMetadata = actualLLMResponses[i].TransformerMetadata
 				if !xtest.Equal(expectedEvent, actualLLMResponses[i]) {
 					t.Fatalf("event %d mismatch:\n%s", i, cmp.Diff(expectedEvent, actualLLMResponses[i]))
 				}
@@ -596,4 +599,96 @@ func TestOutboundTransformer_TransformStream_PreservesPreviousResponseID(t *test
 	require.NotNil(t, actual[2].PreviousResponseID)
 	require.Equal(t, "resp_prev_123", *actual[2].PreviousResponseID)
 	require.Equal(t, llm.DoneResponse, actual[3])
+}
+
+func TestOutboundTransformer_TransformStream_CustomToolCallPreservesNamespace(t *testing.T) {
+	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	const wantNS = "mcp__myserver"
+	events := []*httpclient.StreamEvent{
+		{Type: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_ctc_ns_out","object":"response","created_at":1700000000,"model":"gpt-4o","status":"in_progress","output":[]}}`)},
+		{Type: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"custom_tool_call","status":"in_progress","call_id":"call_ctc_ns_out_1","name":"apply_patch","namespace":"mcp__myserver"}}`)},
+		{Type: "response.custom_tool_call_input.delta", Data: []byte(`{"type":"response.custom_tool_call_input.delta","sequence_number":2,"item_id":"call_ctc_ns_out_1","output_index":0,"delta":"*** Begin Patch\n"}`)},
+		{Type: "response.custom_tool_call_input.done", Data: []byte(`{"type":"response.custom_tool_call_input.done","sequence_number":3,"item_id":"call_ctc_ns_out_1","output_index":0,"input":"*** Begin Patch\n*** End Patch"}`)},
+		{Type: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"type":"custom_tool_call","status":"completed","call_id":"call_ctc_ns_out_1","name":"apply_patch","namespace":"mcp__myserver","input":""}}`)},
+		{Type: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_ctc_ns_out","object":"response","created_at":1700000000,"model":"gpt-4o","status":"completed","output":[{"type":"custom_tool_call","status":"completed","call_id":"call_ctc_ns_out_1","name":"apply_patch","namespace":"mcp__myserver","input":""}]}}`)},
+	}
+
+	stream, err := trans.TransformStream(context.Background(), nil, streams.SliceStream(events))
+	require.NoError(t, err)
+	actual, err := streams.All(stream)
+	require.NoError(t, err)
+	require.NotEmpty(t, actual)
+
+	var sawChunk bool
+	for _, resp := range actual {
+		if resp == llm.DoneResponse {
+			continue
+		}
+		for _, choice := range resp.Choices {
+			if choice.Delta == nil {
+				continue
+			}
+			for _, tc := range choice.Delta.ToolCalls {
+				if tc.Type != llm.ToolTypeResponsesCustomTool || tc.ResponseCustomToolCall == nil {
+					continue
+				}
+				sawChunk = true
+				require.Equal(t, wantNS, tc.ResponseCustomToolCall.Namespace,
+					"D12 streaming custom_tool_call lost namespace mid-stream (got %q)", tc.ResponseCustomToolCall.Namespace)
+			}
+		}
+	}
+	require.True(t, sawChunk, "expected at least one emitted streaming custom_tool_call chunk")
+}
+
+// TestOutboundTransformer_TransformStream_PropagatesNamespaceToolMap covers
+// #1a/D1 streaming outbound: when the request carries a namespace tool map in
+// TransformerMetadata, the outbound stream must propagate it on an early chunk
+// so the inbound stream can restore group identity on function calls.
+func TestOutboundTransformer_TransformStream_PropagatesNamespaceToolMap(t *testing.T) {
+	trans, err := NewOutboundTransformer("https://api.openai.com", "test-api-key")
+	require.NoError(t, err)
+
+	nsMap := map[string]namespaceToolEntry{
+		"mcp__node_repl__run": {Leaf: "run", Namespace: "mcp__node_repl"},
+	}
+	req := &httpclient.Request{
+		TransformerMetadata: map[string]any{
+			responsesNamespaceToolMapTransformerMetadataKey: nsMap,
+		},
+	}
+
+	events := []*httpclient.StreamEvent{
+		{Type: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_ns_out","object":"response","created_at":1700000000,"model":"gpt-4o","status":"in_progress","output":[]}}`)},
+		{Type: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"function_call","status":"in_progress","call_id":"call_ns_out_1","name":"mcp__node_repl__run"}}`)},
+		{Type: "response.function_call_arguments.done", Data: []byte(`{"type":"response.function_call_arguments.done","sequence_number":2,"item_id":"call_ns_out_1","output_index":0,"arguments":"{\"x\":1}"}`)},
+		{Type: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"type":"function_call","status":"completed","call_id":"call_ns_out_1","name":"mcp__node_repl__run","arguments":"{\"x\":1}"}}`)},
+		{Type: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_ns_out","object":"response","created_at":1700000000,"model":"gpt-4o","status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call_ns_out_1","name":"mcp__node_repl__run","arguments":"{\"x\":1}"}]}}`)},
+	}
+
+	stream, err := trans.TransformStream(context.Background(), req, streams.SliceStream(events))
+	require.NoError(t, err)
+	actual, err := streams.All(stream)
+	require.NoError(t, err)
+	require.NotEmpty(t, actual)
+
+	// At least one chunk must carry the namespace tool map.
+	var sawMap bool
+	for _, resp := range actual {
+		if resp == nil || resp == llm.DoneResponse {
+			continue
+		}
+		if raw, ok := resp.TransformerMetadata[responsesNamespaceToolMapTransformerMetadataKey]; ok && raw != nil {
+			sawMap = true
+			m, ok := raw.(map[string]namespaceToolEntry)
+			require.True(t, ok, "namespace tool map must be map[string]namespaceToolEntry")
+			entry, ok := m["mcp__node_repl__run"]
+			require.True(t, ok)
+			require.Equal(t, "run", entry.Leaf)
+			require.Equal(t, "mcp__node_repl", entry.Namespace)
+		}
+	}
+	require.True(t, sawMap, "namespace tool map must be propagated to at least one stream chunk")
 }

@@ -46,6 +46,13 @@ type aggregatedItem struct {
 	Namespace        string
 	Arguments        *strings.Builder
 	EncryptedContent *string
+	CreatedBy        *string
+	Action           *ItemAction
+	Background       *string
+	OutputFormat     *string
+	Quality          *string
+	RevisedPrompt    *string
+	Size             *string
 
 	// For custom_tool_call type
 	Input *string
@@ -58,6 +65,8 @@ type aggregatedItem struct {
 
 	// For reasoning type
 	SummaryParts map[int]*aggregatedSummaryPart
+	// ReasoningTextParts holds type=reasoning content[]/reasoning_text parts.
+	ReasoningTextParts map[int]*aggregatedSummaryPart
 }
 
 type aggregatedSummaryPart struct {
@@ -70,13 +79,15 @@ type aggregatedSummaryPart struct {
 type aggregatedContentPart struct {
 	Type        string
 	Text        *strings.Builder
+	Refusal     *string
 	Annotations []Annotation
 }
 
 func newAggregatedItem() *aggregatedItem {
 	return &aggregatedItem{
-		Arguments:    &strings.Builder{},
-		SummaryParts: make(map[int]*aggregatedSummaryPart),
+		Arguments:          &strings.Builder{},
+		SummaryParts:       make(map[int]*aggregatedSummaryPart),
+		ReasoningTextParts: make(map[int]*aggregatedSummaryPart),
 	}
 }
 
@@ -131,6 +142,28 @@ func ensureSummaryPart(item *aggregatedItem, summaryIndex int) *aggregatedSummar
 
 	return part
 }
+
+func ensureReasoningTextPart(item *aggregatedItem, contentIndex int) *aggregatedSummaryPart {
+	if item == nil {
+		return nil
+	}
+	if item.ReasoningTextParts == nil {
+		item.ReasoningTextParts = make(map[int]*aggregatedSummaryPart)
+	}
+	if part, ok := item.ReasoningTextParts[contentIndex]; ok && part != nil {
+		if part.Text == nil {
+			part.Text = &strings.Builder{}
+		}
+		if part.Type == "" {
+			part.Type = "reasoning_text"
+		}
+		return part
+	}
+	part := &aggregatedSummaryPart{Type: "reasoning_text", Text: &strings.Builder{}}
+	item.ReasoningTextParts[contentIndex] = part
+	return part
+}
+
 
 func newStreamAggregator() *streamAggregator {
 	return &streamAggregator{
@@ -265,6 +298,13 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 			item.Namespace = ev.Item.Namespace
 			item.Arguments.WriteString(ev.Item.Arguments)
 			item.EncryptedContent = ev.Item.EncryptedContent
+			item.CreatedBy = ev.Item.CreatedBy
+			item.Action = ev.Item.Action
+			item.Background = ev.Item.Background
+			item.OutputFormat = ev.Item.OutputFormat
+			item.Quality = ev.Item.Quality
+			item.RevisedPrompt = ev.Item.RevisedPrompt
+			item.Size = ev.Item.Size
 			item.Input = ev.Item.Input
 
 			if len(ev.Item.Summary) > 0 {
@@ -291,6 +331,7 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 				if ev.Part.Text != "" {
 					contentPart.Text.WriteString(ev.Part.Text)
 				}
+				contentPart.Refusal = ev.Part.Refusal
 				contentPart.Annotations = append([]Annotation(nil), ev.Part.Annotations...)
 			}
 
@@ -457,6 +498,39 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 		applyDoneText(part.Text, ev.Text)
 		part.Final = true
 
+	case StreamEventTypeReasoningTextDelta:
+		item := a.getItemForEvent(ev.OutputIndex, ev.ItemID)
+		if item == nil {
+			item = newAggregatedItem()
+			item.Type = "reasoning"
+			item.Status = "in_progress"
+			if ev.ItemID != nil && *ev.ItemID != "" {
+				item.ID = *ev.ItemID
+				a.outputItemsByID[item.ID] = item
+			}
+			a.outputItems[ev.OutputIndex] = append(a.outputItems[ev.OutputIndex], item)
+		}
+		contentIndex := lo.FromPtr(ev.ContentIndex)
+		part := ensureReasoningTextPart(item, contentIndex)
+		part.Text.WriteString(ev.Delta)
+
+	case StreamEventTypeReasoningTextDone:
+		item := a.getItemForEvent(ev.OutputIndex, ev.ItemID)
+		if item == nil {
+			item = newAggregatedItem()
+			item.Type = "reasoning"
+			item.Status = "in_progress"
+			if ev.ItemID != nil && *ev.ItemID != "" {
+				item.ID = *ev.ItemID
+				a.outputItemsByID[item.ID] = item
+			}
+			a.outputItems[ev.OutputIndex] = append(a.outputItems[ev.OutputIndex], item)
+		}
+		contentIndex := lo.FromPtr(ev.ContentIndex)
+		part := ensureReasoningTextPart(item, contentIndex)
+		applyDoneText(part.Text, ev.Text)
+		part.Final = true
+
 	case StreamEventTypeOutputItemDone:
 		// Mark item as completed and update with final data
 		if ev.Item != nil {
@@ -466,6 +540,27 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 			}
 
 			if item != nil {
+				if ev.Item.ID != "" {
+					item.ID = ev.Item.ID
+				}
+				if ev.Item.Type != "" {
+					item.Type = ev.Item.Type
+				}
+				if ev.Item.Role != "" {
+					item.Role = ev.Item.Role
+				}
+				if ev.Item.CallID != "" {
+					item.CallID = ev.Item.CallID
+				}
+				if ev.Item.Name != "" {
+					item.Name = ev.Item.Name
+				}
+				if ev.Item.Namespace != "" {
+					item.Namespace = ev.Item.Namespace
+				}
+				if ev.Item.Input != nil {
+					item.Input = ev.Item.Input
+				}
 				if ev.Item.Status != nil {
 					item.Status = *ev.Item.Status
 				}
@@ -474,8 +569,9 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 					item.Status = "completed"
 				}
 
-				// Update with final data if provided
-				if ev.Item.Arguments != "" {
+				// FunctionCall.arguments is required, so the final snapshot is
+				// authoritative even when its value is the empty string.
+				if ev.Item.Type == "function_call" || ev.Item.Arguments != "" {
 					item.Arguments.Reset()
 					item.Arguments.WriteString(ev.Item.Arguments)
 				}
@@ -491,6 +587,9 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 						}
 						if contentItem.Text != nil {
 							applyDoneText(part.Text, *contentItem.Text)
+						}
+						if contentItem.Refusal != nil {
+							part.Refusal = contentItem.Refusal
 						}
 						if contentItem.Annotations != nil {
 							part.Annotations = append([]Annotation(nil), contentItem.Annotations...)
@@ -509,6 +608,30 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 
 				if ev.Item.EncryptedContent != nil {
 					item.EncryptedContent = ev.Item.EncryptedContent
+				}
+
+				if ev.Item.CreatedBy != nil {
+					item.CreatedBy = ev.Item.CreatedBy
+				}
+
+				if ev.Item.Action != nil {
+					item.Action = ev.Item.Action
+				}
+
+				if ev.Item.Background != nil {
+					item.Background = ev.Item.Background
+				}
+				if ev.Item.OutputFormat != nil {
+					item.OutputFormat = ev.Item.OutputFormat
+				}
+				if ev.Item.Quality != nil {
+					item.Quality = ev.Item.Quality
+				}
+				if ev.Item.RevisedPrompt != nil {
+					item.RevisedPrompt = ev.Item.RevisedPrompt
+				}
+				if ev.Item.Size != nil {
+					item.Size = ev.Item.Size
 				}
 
 				if ev.Item.Result != nil {
@@ -542,6 +665,16 @@ func (a *streamAggregator) processEvent(ev *StreamEvent) {
 		a.applyResponseSnapshot(ev.Response)
 		if ev.Response == nil || ev.Response.Status == nil {
 			a.status = "incomplete"
+		}
+
+	case StreamEventTypeError:
+		// Top-level SSE error is a terminal protocol error. Preserve it on the
+		// aggregated response instead of silently returning an empty/in-progress body.
+		a.status = "failed"
+		a.responseError = &Error{
+			Type:    "error",
+			Code:    ev.Code,
+			Message: ev.Message,
 		}
 	}
 }
@@ -603,12 +736,16 @@ func (a *streamAggregator) buildResponse() *Response {
 				// Convert aggregated content parts to []Item for Content.Items
 				contentItems := make([]Item, 0, len(item.Content))
 				for _, cp := range item.Content {
-					text := cp.Text.String()
-					contentItems = append(contentItems, Item{
+					contentItem := Item{
 						Type:        cp.Type,
-						Text:        &text,
+						Refusal:     cp.Refusal,
 						Annotations: append([]Annotation(nil), cp.Annotations...),
-					})
+					}
+					if cp.Type != "refusal" {
+						text := cp.Text.String()
+						contentItem.Text = &text
+					}
+					contentItems = append(contentItems, contentItem)
 				}
 
 				output = append(output, Item{
@@ -634,12 +771,30 @@ func (a *streamAggregator) buildResponse() *Response {
 
 			case "custom_tool_call":
 				output = append(output, Item{
+					ID:        item.ID,
+					Type:      item.Type,
+					Status:    lo.ToPtr(item.Status),
+					CallID:    item.CallID,
+					Name:      item.Name,
+					Namespace: item.Namespace,
+					Input:     item.Input,
+				})
+
+			case "web_search_call":
+				output = append(output, Item{
 					ID:     item.ID,
 					Type:   item.Type,
 					Status: lo.ToPtr(item.Status),
-					CallID: item.CallID,
-					Name:   item.Name,
-					Input:  item.Input,
+					Action: item.Action,
+				})
+
+			case "compaction", "compaction_summary":
+				output = append(output, Item{
+					ID:               item.ID,
+					Type:             item.Type,
+					Status:           lo.ToPtr(item.Status),
+					EncryptedContent: item.EncryptedContent,
+					CreatedBy:        item.CreatedBy,
 				})
 
 			case "reasoning":
@@ -677,22 +832,56 @@ func (a *streamAggregator) buildResponse() *Response {
 						}
 					}
 
+					var reasoningText []ReasoningContent
+					if len(item.ReasoningTextParts) > 0 {
+						maxContentIndex := -1
+						for idx := range item.ReasoningTextParts {
+							if idx > maxContentIndex {
+								maxContentIndex = idx
+							}
+						}
+						reasoningText = make([]ReasoningContent, 0, maxContentIndex+1)
+						for idx := 0; idx <= maxContentIndex; idx++ {
+							sp, ok := item.ReasoningTextParts[idx]
+							if !ok || sp == nil {
+								reasoningText = append(reasoningText, ReasoningContent{Type: "reasoning_text", Text: ""})
+								continue
+							}
+							partType := sp.Type
+							if partType == "" {
+								partType = "reasoning_text"
+							}
+							var text string
+							if sp.Text != nil {
+								text = sp.Text.String()
+							}
+							reasoningText = append(reasoningText, ReasoningContent{Type: partType, Text: text})
+						}
+					}
+
 					output = append(output, Item{
 						ID:               item.ID,
 						Type:             item.Type,
 						Status:           lo.ToPtr(item.Status),
 						Summary:          summary,
+						ReasoningContent: reasoningText,
 						EncryptedContent: item.EncryptedContent,
 					})
 				}
 
 			case "image_generation_call":
 				output = append(output, Item{
-					ID:     item.ID,
-					Type:   item.Type,
-					Status: lo.ToPtr(item.Status),
-					CallID: item.CallID,
-					Result: item.Result,
+					ID:            item.ID,
+					Type:          item.Type,
+					Status:        lo.ToPtr(item.Status),
+					CallID:        item.CallID,
+					Result:        item.Result,
+					Action:        item.Action,
+					Background:    item.Background,
+					OutputFormat:  item.OutputFormat,
+					Quality:       item.Quality,
+					RevisedPrompt: item.RevisedPrompt,
+					Size:          item.Size,
 				})
 
 			default:

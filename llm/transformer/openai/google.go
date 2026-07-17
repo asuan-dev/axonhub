@@ -5,6 +5,22 @@ import "github.com/looplj/axonhub/llm/transformer/shared"
 // TransformerMetadataKeyGoogleThoughtSignature 用于在 ToolCall TransformerMetadata 中保存 Gemini thought signature。
 const TransformerMetadataKeyGoogleThoughtSignature = shared.TransformerMetadataKeyGoogleThoughtSignature
 
+// TransformerMetadataKeyTopK re-exports the shared neutral key for the top_k sampling parameter.
+const TransformerMetadataKeyTopK = shared.TransformerMetadataKeyTopK
+
+// TransformerMetadataKeyRepetitionPenalty re-exports the shared key for repetition_penalty.
+const TransformerMetadataKeyRepetitionPenalty = shared.TransformerMetadataKeyRepetitionPenalty
+
+// TransformerMetadataKeyMinP re-exports the shared key for min_p.
+const TransformerMetadataKeyMinP = shared.TransformerMetadataKeyMinP
+
+// TransformerMetadataKeyTopA re-exports the shared key for top_a.
+const TransformerMetadataKeyTopA = shared.TransformerMetadataKeyTopA
+
+// TransformerMetadataKeyCacheControl re-exports the shared neutral key for the
+// top-level cache_control directive (OpenRouter/Anthropic prompt-caching marker).
+const TransformerMetadataKeyCacheControl = shared.TransformerMetadataKeyCacheControl
+
 // ToolCallGoogleExtraContent represents Google-specific extension fields for tool calls.
 type ToolCallGoogleExtraContent struct {
 	ThoughtSignature string `json:"thought_signature,omitempty"`

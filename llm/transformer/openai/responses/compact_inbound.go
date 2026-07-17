@@ -120,7 +120,7 @@ func convertCompactMessagesToItems(msgs []llm.Message) []Item {
 	items := make([]Item, 0, len(msgs))
 
 	for _, msg := range msgs {
-		if reasoningItem, ok := buildReasoningItem(msg); ok {
+		if reasoningItem, ok := buildReasoningItem(msg, nil); ok {
 			items = append(items, reasoningItem)
 		}
 
@@ -188,6 +188,13 @@ func convertCompactMessageToItems(msg llm.Message) []Item {
 					Type:     "input_image",
 					ImageURL: lo.ToPtr(part.ImageURL.URL),
 					Detail:   part.ImageURL.Detail,
+				})
+			}
+		case "input_audio":
+			if part.InputAudio != nil {
+				contentItems = append(contentItems, Item{
+					Type:       "input_audio",
+					InputAudio: part.InputAudio,
 				})
 			}
 		case "compaction", "compaction_summary":

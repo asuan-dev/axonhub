@@ -151,7 +151,7 @@ type Request struct {
 	// effect will vary per model, but values between -1 and 1 should decrease or
 	// increase likelihood of selection; values like -100 or 100 should result in a ban
 	// or exclusive selection of the relevant token.
-	LogitBias map[string]int64 `json:"logit_bias,omitempty"`
+	LogitBias map[string]float64 `json:"logit_bias,omitempty"`
 
 	// Set of 16 key-value pairs that can be attached to an object. This can be useful
 	// for storing additional information about the object in a structured format, and
@@ -381,6 +381,23 @@ type Message struct {
 	// 3. OpenAI Responses encrypted content： https://platform.openai.com/docs/api-reference/responses/object#responses-object-output-reasoning-encrypted_content
 	ReasoningSignature *string `json:"reasoning_signature,omitempty"`
 
+	// ResponseReasoningItemID marks an OpenAI Responses request input reasoning item
+	// (type=reasoning) for same-protocol identity round-trip only. Distinct from
+	// Message.ID, which belongs to a following message item when reasoning is merged
+	// with assistant content.
+	//
+	// Presence semantics:
+	//   - non-nil: message originated from a Responses type=reasoning input item.
+	//     The pointed string is the item.id; empty string means the source omitted id
+	//     (outbound must omit id, never synthesize).
+	//   - nil: not a Responses reasoning input item. Ordinary ReasoningContent from
+	//     Chat/Anthropic/etc. must not force a Responses reasoning item solely because
+	//     text is present.
+	//
+	// Scope: request input item identity. This field is not a claim that response
+	// output reasoning item id round-trip is complete.
+	ResponseReasoningItemID *string `json:"response_reasoning_item_id,omitempty"`
+
 	// Help field, will not be sent to the llm service, to adapt the anthropic think signature.
 	// https://platform.claude.com/docs/en/build-with-claude/extended-thinking
 	// This field will be ignore when convert anthropic to other API format.
@@ -396,6 +413,15 @@ type Message struct {
 
 	// Audio contains model-generated audio metadata for assistant messages.
 	Audio *OutputAudio `json:"audio,omitempty"`
+
+	// ReasoningDetails carries structured reasoning detail items (e.g. OpenRouter
+	// reasoning_details: summary/encrypted/text). Carried as raw JSON so
+	// provider-native shapes round-trip without canonical having to model every
+	// variant.
+	ReasoningDetails []json.RawMessage `json:"reasoning_details,omitempty"`
+
+	// Images carries generated images returned by image generation models.
+	Images []ChatImage `json:"images,omitempty"`
 
 	// Copilot-only: X-Initiator quota tracking. Ignored by other providers.
 	Attribution string `json:"attribution,omitempty"`
@@ -522,6 +548,15 @@ type MessageContentPart struct {
 	// InputAudio is the input audio content, required when type is "input_audio"
 	InputAudio *InputAudio `json:"input_audio,omitempty"`
 
+	// OpenAIChatFile preserves the file fields shared by OpenAI Chat file parts
+	// and OpenAI Responses input_file parts. The Responses adapter keeps its
+	// file_url and detail fields in per-part TransformerMetadata because Chat
+	// has no equivalents for them.
+	OpenAIChatFile *OpenAIChatFileContentPart `json:"openai_chat_file,omitempty"`
+
+	// OpenAIChatRefusal preserves a native Chat content-array refusal payload.
+	OpenAIChatRefusal *string `json:"openai_chat_refusal,omitempty"`
+
 	// Compact is the compact content, required when type is "compaction" or "compaction_summary"
 	// This is used for OpenAI Responses API compaction-related items.
 	Compact *CompactContent `json:"compact,omitempty"`
@@ -571,6 +606,16 @@ type InputAudio struct {
 
 	// Base64 encoded audio data.
 	Data string `json:"data"`
+}
+
+// ChatImage represents a generated image returned by an image generation model.
+type ChatImage struct {
+	ImageURL ChatImageURL `json:"image_url"`
+}
+
+// ChatImageURL carries the URL (or base64 data URL) of a generated image.
+type ChatImageURL struct {
+	URL string `json:"url"`
 }
 
 // CompactContent represents compact content from OpenAI Responses API compaction.
@@ -705,6 +750,10 @@ type Response struct {
 	// APIFormat is the outbound API format of the response.
 	// e.g. the response from the chat/completions endpoint is in the openai/chat_completion format.
 	APIFormat APIFormat `json:"api_format,omitempty"`
+
+	// ProviderExtensions carries provider/API-format private response data that
+	// must not be serialized through the common llm response model.
+	ProviderExtensions *ProviderExtensions `json:"-"`
 
 	// TransformerMetadata stores metadata from transformers that process the response.
 	// This field is ignored when serializing to JSON and is only used internally by transformers.

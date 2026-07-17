@@ -10,6 +10,15 @@ import (
 // TransformerMetadataKeyCitations is the key used to store citations in TransformerMetadata.
 const TransformerMetadataKeyCitations = "citations"
 
+// TransformerMetadataKeyVideoPrompt carries the original video generation prompt
+// so the outbound response builder can backfill it.
+const TransformerMetadataKeyVideoPrompt = "video_prompt"
+
+// TransformerMetadataKeyDeprecatedFunctionCallOrigin marks tool_calls that were
+// bridged from deprecated Chat message.function_call. Downstream Chat emitters
+// must re-emit function_call instead of modern tool_calls for these origins.
+const TransformerMetadataKeyDeprecatedFunctionCallOrigin = "openai.chat.function_call_origin"
+
 // Request represents an OpenAI chat completion request.
 // This is a clean OpenAI-specific model without helper fields.
 type Request struct {
@@ -49,6 +58,18 @@ type Request struct {
 	// TopP for nucleus sampling.
 	TopP *float64 `json:"top_p,omitempty"`
 
+	// TopK for top-k sampling (OpenRouter extension).
+	TopK *int64 `json:"top_k,omitempty"`
+
+	// RepetitionPenalty penalizes repeated tokens (OpenRouter extension).
+	RepetitionPenalty *float64 `json:"repetition_penalty,omitempty"`
+
+	// MinP minimum probability threshold (OpenRouter extension).
+	MinP *float64 `json:"min_p,omitempty"`
+
+	// TopA top-a sampling threshold (OpenRouter extension).
+	TopA *float64 `json:"top_a,omitempty"`
+
 	// PromptCacheKey is used by OpenAI to cache responses.
 	PromptCacheKey *string `json:"prompt_cache_key,omitzero"`
 
@@ -59,10 +80,15 @@ type Request struct {
 	User *string `json:"user,omitempty"`
 
 	// LogitBias modifies likelihood of specified tokens.
-	LogitBias map[string]int64 `json:"logit_bias,omitempty"`
+	LogitBias map[string]float64 `json:"logit_bias,omitempty"`
 
 	// Metadata is key-value pairs attached to the object.
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// CacheControl is the OpenRouter top-level cache_control directive
+	// (Anthropic-style prompt-caching marker). Carried through TransformerMetadata
+	// cross-format; canonical llm.Request has no CacheControl field.
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 
 	// Modalities specifies output types (text, audio, image).
 	Modalities []string `json:"modalities,omitempty"`
@@ -76,6 +102,12 @@ type Request struct {
 	// ReasoningSummary is the summary type for reasoning models ("auto", "concise", "detailed").
 	// Extension field, not part of official OpenAI Chat Completions API.
 	ReasoningSummary *string `json:"reasoning_summary,omitempty"`
+
+	// Reasoning is the OpenRouter chat reasoning configuration object {effort, summary}
+	// (yaml:4884). When present, effort/summary override the flat reasoning_effort/
+	// reasoning_summary shorthand (spec: reasoning_effort is a shorthand, "cannot be
+	// used simultaneously with reasoning.effort if they differ" — object form wins).
+	Reasoning *ChatReasoningConfig `json:"reasoning,omitempty"`
 
 	// ServiceTier specifies the processing type.
 	ServiceTier *string `json:"service_tier,omitempty"`
@@ -104,6 +136,20 @@ type Request struct {
 type Thinking struct {
 	// Type is "enabled" or "disabled".
 	Type string `json:"type"`
+}
+
+// ChatReasoningConfig mirrors the OpenRouter ChatRequest.reasoning object {effort, summary}.
+type ChatReasoningConfig struct {
+	// Effort constrains reasoning effort (max/xhigh/high/medium/low/minimal/none/null).
+	Effort string `json:"effort,omitempty"`
+	// Summary is the reasoning summary verbosity (auto/concise/detailed/null).
+	Summary *string `json:"summary,omitempty"`
+}
+
+// CacheControl mirrors the OpenRouter/Anthropic top-level cache_control directive.
+type CacheControl struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
 }
 
 // StreamOptions for streaming responses.
@@ -172,11 +218,22 @@ type Message struct {
 	ToolCallID *string    `json:"tool_call_id,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 
+	// FunctionCall is the deprecated assistant message function-call shape.
+	// Prefer ToolCalls for modern Chat Completions; keep this only for
+	// same-protocol compatibility with legacy clients/providers.
+	FunctionCall *FunctionCall `json:"function_call,omitempty"`
+
 	// ReasoningContent for deepseek-reasoner support.
 	ReasoningContent *string `json:"reasoning_content,omitempty"`
 
 	// Reasoning is used by some providers (e.g., Synthetic) instead of reasoning_content.
 	Reasoning *string `json:"reasoning,omitempty"`
+
+	// ReasoningDetails carries structured reasoning detail items (OpenRouter).
+	ReasoningDetails []json.RawMessage `json:"reasoning_details,omitempty"`
+
+	// Images carries generated images from image generation models.
+	Images []llm.ChatImage `json:"images,omitempty"`
 
 	// Annotations contains citation information for the message.
 	// This is used by providers like Perplexity to provide source URLs.
@@ -259,11 +316,20 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 
 // MessageContentPart represents different types of content (text, image, video, etc.)
 type MessageContentPart struct {
-	Type       string      `json:"type"`
-	Text       *string     `json:"text,omitempty"`
-	ImageURL   *ImageURL   `json:"image_url,omitempty"`
-	VideoURL   *VideoURL   `json:"video_url,omitempty"`
-	InputAudio *InputAudio `json:"input_audio,omitempty"`
+	Type       string       `json:"type"`
+	Text       *string      `json:"text,omitempty"`
+	ImageURL   *ImageURL    `json:"image_url,omitempty"`
+	VideoURL   *VideoURL    `json:"video_url,omitempty"`
+	InputAudio *InputAudio  `json:"input_audio,omitempty"`
+	File       *FileContent `json:"file,omitempty"`
+	Refusal    *string      `json:"refusal,omitempty"`
+}
+
+// FileContent is the OpenAI Chat file content-part payload.
+type FileContent struct {
+	FileData *string `json:"file_data,omitempty"`
+	FileID   *string `json:"file_id,omitempty"`
+	Filename *string `json:"filename,omitempty"`
 }
 
 // ImageURL represents an image URL with optional detail level.
@@ -353,15 +419,34 @@ type OpenAIError struct {
 	Detail     llm.ErrorDetail `json:"error"`
 }
 
-// Tool represents a function tool.
+// Tool represents an OpenAI Chat function or custom tool.
 type Tool struct {
-	Type     string   `json:"type"`
-	Function Function `json:"function"`
+	Type     string      `json:"type"`
+	Function Function    `json:"function,omitempty"`
+	Custom   *CustomTool `json:"custom,omitempty"`
+}
+
+// CustomTool is the Chat Completions custom-tool declaration.
+type CustomTool struct {
+	Name        string          `json:"name"`
+	Description *string         `json:"description,omitempty"`
+	Format      json.RawMessage `json:"format,omitempty"`
+}
+
+func (t Tool) MarshalJSON() ([]byte, error) {
+	if t.Type == "custom" && t.Custom != nil {
+		return json.Marshal(struct {
+			Type   string      `json:"type"`
+			Custom *CustomTool `json:"custom"`
+		}{Type: t.Type, Custom: t.Custom})
+	}
+	type toolAlias Tool
+	return json.Marshal(toolAlias(t))
 }
 
 // ToLLMTool converts OpenAI Tool to unified llm.Tool.
 func (t Tool) ToLLMTool() llm.Tool {
-	return llm.Tool{
+	result := llm.Tool{
 		Type: t.Type,
 		Function: llm.Function{
 			Name:        t.Function.Name,
@@ -370,6 +455,14 @@ func (t Tool) ToLLMTool() llm.Tool {
 			Strict:      t.Function.Strict,
 		},
 	}
+	if t.Type == "custom" && t.Custom != nil {
+		result.OpenAIChatCustomTool = &llm.OpenAIChatCustomTool{
+			Name:        t.Custom.Name,
+			Description: t.Custom.Description,
+			Format:      append(json.RawMessage(nil), t.Custom.Format...),
+		}
+	}
+	return result
 }
 
 // Function represents a function definition.
@@ -387,6 +480,53 @@ type FunctionCall struct {
 }
 
 // ToolCallExtraContent represents provider-specific extension fields for tool calls.
+// CustomToolCall is the Chat Completions custom-tool call payload.
+type CustomToolCall struct {
+	Name  string `json:"name"`
+	Input string `json:"input"`
+	Index *int   `json:"-"`
+}
+
+func (t ToolCall) MarshalJSON() ([]byte, error) {
+	if t.Type == "custom" && t.Custom != nil {
+		return json.Marshal(struct {
+			ID     string          `json:"id,omitempty"`
+			Type   string          `json:"type"`
+			Custom *CustomToolCall `json:"custom"`
+			Index  *int            `json:"index,omitempty"`
+		}{ID: t.ID, Type: t.Type, Custom: t.Custom, Index: t.Custom.Index})
+	}
+	type toolCallAlias ToolCall
+	return json.Marshal(toolCallAlias(t))
+}
+
+func (t *ToolCall) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID     string          `json:"id,omitempty"`
+		Type   string          `json:"type,omitempty"`
+		Custom *CustomToolCall `json:"custom,omitempty"`
+		Index  *int            `json:"index,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Type == "custom" && raw.Custom != nil {
+		raw.Custom.Index = raw.Index
+		*t = ToolCall{ID: raw.ID, Type: raw.Type, Custom: raw.Custom}
+		if raw.Index != nil {
+			t.Index = *raw.Index
+		}
+		return nil
+	}
+	type toolCallAlias ToolCall
+	var alias toolCallAlias
+	if err := json.Unmarshal(data, &alias); err != nil {
+		return err
+	}
+	*t = ToolCall(alias)
+	return nil
+}
+
 type ToolCallExtraContent struct {
 	Google *ToolCallGoogleExtraContent `json:"google,omitempty"`
 }
@@ -398,10 +538,11 @@ type ToolCallExtraFields struct {
 
 // ToolCall represents a tool call in the response.
 type ToolCall struct {
-	ID       string       `json:"id,omitempty"`
-	Type     string       `json:"type,omitempty"`
-	Function FunctionCall `json:"function"`
-	Index    int          `json:"index"`
+	ID       string          `json:"id,omitempty"`
+	Type     string          `json:"type,omitempty"`
+	Function FunctionCall    `json:"function"`
+	Custom   *CustomToolCall `json:"custom,omitempty"`
+	Index    int             `json:"index"`
 	// ExtraContent carries provider-specific extension fields, such as Gemini OpenAI thought signature.
 	ExtraContent *ToolCallExtraContent `json:"extra_content,omitempty"`
 	// ExtraFields is a compatibility wrapper for payloads that nest extra_content under extra_fields.
@@ -415,40 +556,89 @@ type ToolFunction struct {
 
 // ToolChoice represents the tool choice parameter.
 type ToolChoice struct {
-	ToolChoice      *string          `json:"tool_choice,omitempty"`
-	NamedToolChoice *NamedToolChoice `json:"named_tool_choice,omitempty"`
+	ToolChoice      *string                 `json:"tool_choice,omitempty"`
+	NamedToolChoice *NamedToolChoice        `json:"named_tool_choice,omitempty"`
+	Custom          *CustomToolChoice       `json:"custom,omitempty"`
+	AllowedTools    *AllowedToolsToolChoice `json:"allowed_tools,omitempty"`
 }
 
-// NamedToolChoice represents a named tool choice.
+// NamedToolChoice represents a named function tool choice.
 type NamedToolChoice struct {
 	Type     string       `json:"type"`
 	Function ToolFunction `json:"function"`
+}
+
+// CustomToolChoice represents a named Chat custom-tool choice.
+type CustomToolChoice struct {
+	Name string `json:"name"`
+}
+
+// AllowedToolsToolChoice constrains Chat tool selection to the listed native
+// tool references. The references are raw because the official wire shape is
+// an array of maps rather than a shared llm.Tool contract.
+type AllowedToolsToolChoice struct {
+	Mode  string            `json:"mode"`
+	Tools []json.RawMessage `json:"tools"`
 }
 
 func (t ToolChoice) MarshalJSON() ([]byte, error) {
 	if t.ToolChoice != nil {
 		return json.Marshal(t.ToolChoice)
 	}
-
+	if t.Custom != nil {
+		return json.Marshal(struct {
+			Type   string            `json:"type"`
+			Custom *CustomToolChoice `json:"custom"`
+		}{Type: "custom", Custom: t.Custom})
+	}
+	if t.AllowedTools != nil {
+		return json.Marshal(struct {
+			Type         string                  `json:"type"`
+			AllowedTools *AllowedToolsToolChoice `json:"allowed_tools"`
+		}{Type: "allowed_tools", AllowedTools: t.AllowedTools})
+	}
 	return json.Marshal(t.NamedToolChoice)
 }
 
 func (t *ToolChoice) UnmarshalJSON(data []byte) error {
 	var str string
-
-	err := json.Unmarshal(data, &str)
-	if err == nil {
+	if err := json.Unmarshal(data, &str); err == nil {
 		t.ToolChoice = &str
+		t.NamedToolChoice = nil
+		t.Custom = nil
+		t.AllowedTools = nil
 		return nil
 	}
 
-	var named NamedToolChoice
-
-	err = json.Unmarshal(data, &named)
-	if err == nil {
-		t.NamedToolChoice = &named
+	var raw struct {
+		Type         string                  `json:"type"`
+		Function     *ToolFunction           `json:"function"`
+		Custom       *CustomToolChoice       `json:"custom"`
+		AllowedTools *AllowedToolsToolChoice `json:"allowed_tools"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return errors.New("invalid tool choice type")
+	}
+	if raw.Type == "custom" && raw.Custom != nil {
+		t.ToolChoice = nil
+		t.NamedToolChoice = nil
+		t.Custom = raw.Custom
+		t.AllowedTools = nil
 		return nil
 	}
-
+	if raw.Type == "allowed_tools" && raw.AllowedTools != nil {
+		t.ToolChoice = nil
+		t.NamedToolChoice = nil
+		t.Custom = nil
+		t.AllowedTools = raw.AllowedTools
+		return nil
+	}
+	if raw.Function != nil {
+		t.ToolChoice = nil
+		t.Custom = nil
+		t.AllowedTools = nil
+		t.NamedToolChoice = &NamedToolChoice{Type: raw.Type, Function: *raw.Function}
+		return nil
+	}
 	return errors.New("invalid tool choice type")
 }

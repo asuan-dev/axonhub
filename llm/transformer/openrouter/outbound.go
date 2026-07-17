@@ -19,6 +19,7 @@ import (
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
 	"github.com/looplj/axonhub/llm/transformer/openai"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // Config holds all configuration for the OpenRouter outbound transformer.
@@ -110,30 +111,7 @@ func (t *OutboundTransformer) TransformRequest(
 		return nil, fmt.Errorf("%w: failed to transform request: %w", transformer.ErrInvalidRequest, err)
 	}
 
-	// Prepare headers
-	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
-	headers.Set("Accept", "application/json")
-
-	// Get API key from provider
-	apiKey := t.APIKeyProvider.Get(ctx)
-
-	auth := &httpclient.AuthConfig{
-		Type:   httpclient.AuthTypeBearer,
-		APIKey: apiKey,
-	}
-
-	url := t.BaseURL + "/chat/completions"
-
-	return &httpclient.Request{
-		Method:      http.MethodPost,
-		URL:         url,
-		Headers:     headers,
-		Body:        body,
-		Auth:        auth,
-		ContentType: "application/json",
-		APIFormat:   string(llm.APIFormatOpenAIChatCompletion),
-	}, nil
+	return shared.BuildChatCompletionHTTPRequest(ctx, t.APIKeyProvider, t.BaseURL, body, llmReq), nil
 }
 
 // buildImageGenerationRequest builds the request for OpenRouter image generation.
@@ -222,7 +200,7 @@ func (t *OutboundTransformer) buildImageGenerationRequest(llmReq *llm.Request) (
 	}
 
 	// Save model to TransformerMetadata for response transformation
-	rawReq.TransformerMetadata = map[string]any{"model": llmReq.Model}
+	rawReq.TransformerMetadata = map[string]any{shared.MetadataKeyModel: llmReq.Model}
 
 	return rawReq, nil
 }
@@ -310,7 +288,9 @@ func (t *OutboundTransformer) TransformResponse(
 		return nil, fmt.Errorf("failed to unmarshal chat completion response: %w", err)
 	}
 
-	return chatResp.ToOpenAIResponse().ToLLMResponse(), nil
+	llmResp := chatResp.ToOpenAIResponse().ToLLMResponse()
+	shared.MergeResponseMetadata(llmResp, httpResp)
+	return llmResp, nil
 }
 
 // transformImageGenerationResponse transforms OpenRouter image generation response to llm.Response.
@@ -337,7 +317,7 @@ func (t *OutboundTransformer) transformImageGenerationResponse(httpResp *httpcli
 	model := "image-generation"
 
 	if httpResp.Request != nil && httpResp.Request.TransformerMetadata != nil {
-		if m, ok := httpResp.Request.TransformerMetadata["model"].(string); ok && m != "" {
+		if m, ok := httpResp.Request.TransformerMetadata[shared.MetadataKeyModel].(string); ok && m != "" {
 			model = m
 		}
 	}
@@ -444,6 +424,13 @@ func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclie
 	transformedStream := streams.MapErr(filteredStream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
 		return t.TransformStreamChunk(ctx, event)
 	})
+
+	// Propagate request TransformerMetadata onto the first chunk so cross-protocol
+	// fields (e.g. the namespace tool map) survive the streaming round-trip —
+	// mirroring the openai base outbound (outbound.go:305).
+	if req != nil && req.TransformerMetadata != nil {
+		transformedStream = shared.PropagateStreamMetadata(transformedStream, req.TransformerMetadata)
+	}
 
 	// Always append our own DONE event at the end
 	return streams.AppendStream(transformedStream, llm.DoneResponse), nil

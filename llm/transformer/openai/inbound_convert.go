@@ -1,6 +1,8 @@
 package openai
 
 import (
+	"encoding/json"
+
 	"github.com/samber/lo"
 
 	"github.com/looplj/axonhub/llm"
@@ -28,6 +30,14 @@ func (tc ToolCall) ToLLMToolCall() llm.ToolCall {
 		extraContent.Google.ThoughtSignature != "" {
 		toolCall.TransformerMetadata = map[string]any{
 			TransformerMetadataKeyGoogleThoughtSignature: extraContent.Google.ThoughtSignature,
+		}
+	}
+
+	if tc.Type == "custom" && tc.Custom != nil {
+		toolCall.OpenAIChatCustomToolCall = &llm.OpenAIChatCustomToolCall{
+			Name:  tc.Custom.Name,
+			Input: tc.Custom.Input,
+			Index: tc.Custom.Index,
 		}
 	}
 
@@ -65,6 +75,33 @@ func (r *Request) ToLLMRequest() *llm.Request {
 		Stream:              r.Stream,
 		ParallelToolCalls:   r.ParallelToolCalls,
 		Verbosity:           r.Verbosity,
+	}
+
+	// OpenRouter chat reasoning object {effort, summary} overrides the flat
+	// reasoning_effort/reasoning_summary shorthand. The object is the explicit
+	// form; the flat keys are shorthands (spec: cannot be used simultaneously
+	// with reasoning.effort if they differ). Override only the sub-fields that
+	// are actually set so a partial object does not clobber a valid flat value.
+	if r.Reasoning != nil {
+		if r.Reasoning.Effort != "" {
+			req.ReasoningEffort = r.Reasoning.Effort
+		}
+		if r.Reasoning.Summary != nil {
+			req.ReasoningSummary = r.Reasoning.Summary
+		}
+	}
+
+	// Preserve top-level cache_control (OpenRouter/Anthropic prompt-caching
+	// marker) through TransformerMetadata as opaque json.RawMessage; canonical
+	// llm.Request has no CacheControl field, so without this it is dropped on
+	// cross-format conversion (mirrors top_k handling).
+	if r.CacheControl != nil {
+		if b, err := json.Marshal(r.CacheControl); err == nil {
+			if req.TransformerMetadata == nil {
+				req.TransformerMetadata = map[string]any{}
+			}
+			req.TransformerMetadata[TransformerMetadataKeyCacheControl] = json.RawMessage(b)
+		}
 	}
 
 	// Convert messages
@@ -105,6 +142,17 @@ func (r *Request) ToLLMRequest() *llm.Request {
 				},
 			}
 		}
+		if r.ToolChoice.Custom != nil {
+			req.ToolChoice.OpenAIChatCustomToolChoice = &llm.OpenAIChatCustomToolChoice{
+				Name: r.ToolChoice.Custom.Name,
+			}
+		}
+		if r.ToolChoice.AllowedTools != nil {
+			req.ToolChoice.OpenAIChatAllowedTools = &llm.OpenAIChatAllowedToolsChoice{
+				Mode:  r.ToolChoice.AllowedTools.Mode,
+				Tools: append([]json.RawMessage(nil), r.ToolChoice.AllowedTools.Tools...),
+			}
+		}
 	}
 
 	// Convert ResponseFormat
@@ -112,6 +160,38 @@ func (r *Request) ToLLMRequest() *llm.Request {
 		req.ResponseFormat = &llm.ResponseFormat{
 			Type:       r.ResponseFormat.Type,
 			JSONSchema: r.ResponseFormat.JSONSchema,
+		}
+	}
+
+	// Preserve top_k through TransformerMetadata; canonical llm.Request has no
+	// TopK field, so without this the sampling parameter is dropped on cross-format
+	// conversion (mirrors Anthropic top_k handling, shared neutral key).
+	if r.TopK != nil {
+		topK := *r.TopK
+		if req.TransformerMetadata == nil {
+			req.TransformerMetadata = map[string]any{}
+		}
+		req.TransformerMetadata[TransformerMetadataKeyTopK] = &topK
+	}
+
+	// Preserve OpenRouter sampling knobs (repetition_penalty/min_p/top_a) through
+	// TransformerMetadata; canonical llm.Request has no fields for these (mirrors
+	// top_k handling, shared neutral keys).
+	if r.RepetitionPenalty != nil || r.MinP != nil || r.TopA != nil {
+		if req.TransformerMetadata == nil {
+			req.TransformerMetadata = map[string]any{}
+		}
+		if r.RepetitionPenalty != nil {
+			rp := *r.RepetitionPenalty
+			req.TransformerMetadata[TransformerMetadataKeyRepetitionPenalty] = &rp
+		}
+		if r.MinP != nil {
+			minP := *r.MinP
+			req.TransformerMetadata[TransformerMetadataKeyMinP] = &minP
+		}
+		if r.TopA != nil {
+			topA := *r.TopA
+			req.TransformerMetadata[TransformerMetadataKeyTopA] = &topA
 		}
 	}
 
@@ -132,6 +212,8 @@ func (m Message) ToLLMMessage() llm.Message {
 		ToolCallID:       m.ToolCallID,
 		ReasoningContent: m.ReasoningContent,
 		Reasoning:        m.Reasoning,
+		ReasoningDetails: m.ReasoningDetails,
+		Images:           m.Images,
 	}
 
 	if m.Audio != nil {
@@ -169,6 +251,23 @@ func (m Message) ToLLMMessage() llm.Message {
 		if raw, ok := firstThoughtSignature.TransformerMetadata[TransformerMetadataKeyGoogleThoughtSignature].(string); ok {
 			msg.ReasoningSignature = lo.ToPtr(raw)
 		}
+	}
+
+	// Deprecated Chat message.function_call is a predecessor of tool_calls.
+	// Bridge it into the modern common lifecycle when no modern tool_calls exist,
+	// and mark origin so same-protocol emitters can restore the legacy wire shape
+	// for stream deltas and multi-turn history (not only final finish_reason).
+	if len(msg.ToolCalls) == 0 && m.FunctionCall != nil && (m.FunctionCall.Name != "" || m.FunctionCall.Arguments != "") {
+		msg.ToolCalls = []llm.ToolCall{{
+			Type: "function",
+			Function: llm.FunctionCall{
+				Name:      m.FunctionCall.Name,
+				Arguments: m.FunctionCall.Arguments,
+			},
+			TransformerMetadata: map[string]any{
+				TransformerMetadataKeyDeprecatedFunctionCallOrigin: true,
+			},
+		}}
 	}
 
 	// Convert Annotations
@@ -241,6 +340,17 @@ func (p MessageContentPart) ToLLMPart() llm.MessageContentPart {
 		}
 	}
 
+	if p.File != nil {
+		part.OpenAIChatFile = &llm.OpenAIChatFileContentPart{
+			FileData: p.File.FileData,
+			FileID:   p.File.FileID,
+			Filename: p.File.Filename,
+		}
+	}
+	if p.Refusal != nil {
+		part.OpenAIChatRefusal = p.Refusal
+	}
+
 	return part
 }
 
@@ -287,6 +397,48 @@ func ResponseFromLLM(r *llm.Response) *Response {
 	return resp
 }
 
+// hasDeprecatedFunctionCallOrigin reports whether tool_calls were bridged from
+// deprecated Chat message/delta.function_call.
+func hasDeprecatedFunctionCallOrigin(toolCalls []llm.ToolCall) bool {
+	for _, tc := range toolCalls {
+		if tc.TransformerMetadata == nil {
+			continue
+		}
+		if origin, ok := tc.TransformerMetadata[TransformerMetadataKeyDeprecatedFunctionCallOrigin].(bool); ok && origin {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldEmitDeprecatedFunctionCall decides whether the Chat wire shape must use
+// legacy function_call instead of modern tool_calls.
+func shouldEmitDeprecatedFunctionCall(toolCalls []llm.ToolCall, finishReason *string) bool {
+	if hasDeprecatedFunctionCallOrigin(toolCalls) {
+		return true
+	}
+	return finishReason != nil && *finishReason == "function_call" && len(toolCalls) > 0
+}
+
+// messageFromLLMPreservingDeprecatedFunctionCall restores deprecated
+// function_call for same-protocol Chat clients, including stream deltas where
+// finish_reason is still null.
+func messageFromLLMPreservingDeprecatedFunctionCall(m llm.Message, finishReason *string) Message {
+	if shouldEmitDeprecatedFunctionCall(m.ToolCalls, finishReason) && len(m.ToolCalls) > 0 {
+		first := m.ToolCalls[0]
+		// Build without modern tool_calls, then attach legacy function_call.
+		legacy := m
+		legacy.ToolCalls = nil
+		msg := MessageFromLLM(legacy)
+		msg.FunctionCall = &FunctionCall{
+			Name:      first.Function.Name,
+			Arguments: first.Function.Arguments,
+		}
+		return msg
+	}
+	return MessageFromLLM(m)
+}
+
 // ChoiceFromLLM creates OpenAI Choice from unified llm.Choice.
 func ChoiceFromLLM(c llm.Choice) Choice {
 	choice := Choice{
@@ -295,12 +447,12 @@ func ChoiceFromLLM(c llm.Choice) Choice {
 	}
 
 	if c.Message != nil {
-		msg := MessageFromLLM(*c.Message)
+		msg := messageFromLLMPreservingDeprecatedFunctionCall(*c.Message, c.FinishReason)
 		choice.Message = &msg
 	}
 
 	if c.Delta != nil {
-		delta := MessageFromLLM(*c.Delta)
+		delta := messageFromLLMPreservingDeprecatedFunctionCall(*c.Delta, c.FinishReason)
 		choice.Delta = &delta
 	}
 

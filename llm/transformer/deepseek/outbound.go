@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 
 	"github.com/samber/lo"
@@ -15,6 +14,7 @@ import (
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
 	"github.com/looplj/axonhub/llm/transformer/openai"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 type Config struct {
@@ -136,27 +136,7 @@ func (t *OutboundTransformer) TransformRequest(
 		return nil, fmt.Errorf("failed to encode request: %w", err)
 	}
 
-	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
-	headers.Set("Accept", "application/json")
-
-	apiKey := t.APIKeyProvider.Get(ctx)
-
-	auth := &httpclient.AuthConfig{
-		Type:   "bearer",
-		APIKey: apiKey,
-	}
-
-	url := t.BaseURL + "/chat/completions"
-
-	return &httpclient.Request{
-		Method:    http.MethodPost,
-		URL:       url,
-		Headers:   headers,
-		Body:      body,
-		Auth:      auth,
-		APIFormat: string(llm.APIFormatOpenAIChatCompletion),
-	}, nil
+	return shared.BuildChatCompletionHTTPRequest(ctx, t.APIKeyProvider, t.BaseURL, body, llmReq), nil
 }
 
 func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {

@@ -17,6 +17,7 @@ import (
 	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
 	"github.com/looplj/axonhub/llm/transformer"
 	"github.com/looplj/axonhub/llm/transformer/openai"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // Config holds all configuration for the Doubao outbound transformer.
@@ -161,29 +162,7 @@ func (t *OutboundTransformer) TransformRequest(
 		return nil, fmt.Errorf("failed to transform request: %w", err)
 	}
 
-	// Prepare headers
-	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
-	headers.Set("Accept", "application/json")
-
-	// Get API key from provider
-	apiKey := t.APIKeyProvider.Get(ctx)
-
-	auth := &httpclient.AuthConfig{
-		Type:   "bearer",
-		APIKey: apiKey,
-	}
-
-	url := t.BaseURL + "/chat/completions"
-
-	return &httpclient.Request{
-		Method:    http.MethodPost,
-		URL:       url,
-		Headers:   headers,
-		Body:      body,
-		Auth:      auth,
-		APIFormat: string(llm.APIFormatOpenAIChatCompletion),
-	}, nil
+	return shared.BuildChatCompletionHTTPRequest(ctx, t.APIKeyProvider, t.BaseURL, body, llmReq), nil
 }
 
 // buildImageGenerationAPIRequest builds the HTTP request to call the Doubao Image Generation API.
@@ -283,7 +262,7 @@ func (t *OutboundTransformer) buildImageGenerationAPIRequest(llmReq *llm.Request
 		request.TransformerMetadata = map[string]any{}
 	}
 
-	request.TransformerMetadata["model"] = llmReq.Model
+	request.TransformerMetadata[shared.MetadataKeyModel] = llmReq.Model
 
 	return request, nil
 }

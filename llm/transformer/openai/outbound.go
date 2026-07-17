@@ -17,6 +17,7 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // PlatformType represents the platform type for OpenAI API.
@@ -193,6 +194,8 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		reasoningField = ReasoningFieldContent
 	}
 
+	llmReq = expandResponsesCanonicalToolsForChat(llmReq)
+
 	// Convert to OpenAI Request format (this strips helper fields)
 	oaiReq := RequestFromLLM(llmReq, reasoningField)
 	// Apply per-channel reasoning_effort mapping for non-standard OpenAI-compatible providers.
@@ -205,7 +208,17 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		stripUnsupportedToolCallExtraContent(oaiReq)
 	}
 
-	body, err := json.Marshal(oaiReq)
+	var (
+		body []byte
+		err  error
+	)
+	if t.config.PlatformType == PlatformOpenAI {
+		// Preserve Chat-native raw top-level fields such as n without widening
+		// the shared request model or common response multi-choice semantics.
+		body, err = marshalOpenAIChatRequest(oaiReq, llmReq)
+	} else {
+		body, err = json.Marshal(oaiReq)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform request: %w", err)
 	}
@@ -229,7 +242,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		return nil, fmt.Errorf("failed to build platform URL: %w", err)
 	}
 
-	return &httpclient.Request{
+	httpReq := &httpclient.Request{
 		Method:    http.MethodPost,
 		URL:       url,
 		Headers:   headers,
@@ -237,7 +250,141 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		Auth:      authConfig,
 		APIFormat: string(llm.APIFormatOpenAIChatCompletion),
 		Metadata:  nil,
-	}, nil
+	}
+	shared.RecordOpenAIChatUnsupportedNativeToolLossyDowngrades(llmReq)
+	shared.RecordResponsesLossyDowngradeDiagnosticsForTarget(llmReq, llm.APIFormatOpenAIChatCompletion)
+	shared.RecordAnthropicNativeLossyDowngradesForTarget(llmReq, llm.APIFormatOpenAIChatCompletion)
+	recordOpenAIChatResponsesNativeLossyDowngrades(llmReq)
+	shared.PropagateRequestMetadata(httpReq, llmReq)
+	return httpReq, nil
+}
+
+func recordOpenAIChatResponsesNativeLossyDowngrades(llmReq *llm.Request) {
+	if llmReq == nil || llmReq.APIFormat != llm.APIFormatOpenAIResponse {
+		return
+	}
+
+	llm.AddLossyDowngradeIfPresent(
+		llmReq,
+		llm.APIFormatOpenAIResponse,
+		"previous_response_id",
+		llm.APIFormatOpenAIChatCompletion,
+		llmReq.PreviousResponseID != nil,
+	)
+
+	var requestExt *llm.OpenAIResponsesRequestExtensions
+	if llmReq.ProviderExtensions != nil && llmReq.ProviderExtensions.OpenAIResponses != nil {
+		requestExt = llmReq.ProviderExtensions.OpenAIResponses.Request
+	}
+	hasInputFileURL := hasResponsesInputFilePartMetadata(llmReq, "openai_responses_input_file_url")
+	hasInputFileDetail := hasResponsesInputFilePartMetadata(llmReq, "openai_responses_input_file_detail")
+	for _, field := range []struct {
+		name    string
+		present bool
+	}{
+		{name: "include", present: requestExt != nil && len(requestExt.Include) > 0},
+		{name: "max_tool_calls", present: requestExt != nil && requestExt.MaxToolCalls != nil},
+		{name: "prompt_cache_retention", present: requestExt != nil && requestExt.PromptCacheRetention != nil},
+		{name: "truncation", present: requestExt != nil && requestExt.Truncation != nil},
+		{name: "background", present: requestExt != nil && requestExt.Background != nil},
+		{name: "prompt", present: requestExt != nil && len(requestExt.RawPrompt) > 0},
+		{name: "stream_options", present: requestExt != nil && len(requestExt.RawStreamOptions) > 0},
+		{name: "tool_choice", present: requestExt != nil && len(requestExt.RawToolChoice) > 0 && llmReq.ToolChoice == nil},
+		{name: "input_file.file_url", present: hasInputFileURL},
+		{name: "input_file.detail", present: hasInputFileDetail},
+	} {
+		llm.AddLossyDowngradeIfPresent(
+			llmReq,
+			llm.APIFormatOpenAIResponse,
+			field.name,
+			llm.APIFormatOpenAIChatCompletion,
+			field.present,
+		)
+	}
+}
+
+func hasResponsesInputFilePartMetadata(llmReq *llm.Request, key string) bool {
+	if llmReq == nil {
+		return false
+	}
+
+	for _, message := range llmReq.Messages {
+		for _, part := range message.Content.MultipleContent {
+			if part.Type != "file" || part.TransformerMetadata == nil {
+				continue
+			}
+			if value, ok := part.TransformerMetadata[key]; ok && value != nil {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func expandResponsesCanonicalToolsForChat(llmReq *llm.Request) *llm.Request {
+	if llmReq == nil || llmReq.ProviderExtensions == nil || llmReq.ProviderExtensions.OpenAIResponses == nil || llmReq.ProviderExtensions.OpenAIResponses.Request == nil {
+		return llmReq
+	}
+
+	requestExt := llmReq.ProviderExtensions.OpenAIResponses.Request
+	additionalTools := requestExt.AdditionalToolsCanonicalTools
+	loadedTools := requestExt.ToolSearchOutputCanonicalTools
+	if len(additionalTools) == 0 && len(loadedTools) == 0 {
+		return llmReq
+	}
+
+	merged := append([]llm.Tool(nil), llmReq.Tools...)
+	for _, tools := range [][]llm.Tool{additionalTools, loadedTools} {
+		for _, tool := range tools {
+			if !containsChatToolIdentity(merged, tool) {
+				merged = append(merged, tool)
+			}
+		}
+	}
+	if len(merged) == len(llmReq.Tools) {
+		return llmReq
+	}
+
+	cloned := *llmReq
+	cloned.Tools = merged
+	return &cloned
+}
+
+func containsChatToolIdentity(tools []llm.Tool, candidate llm.Tool) bool {
+	candidateName := chatToolName(candidate)
+	if candidateName == "" {
+		return false
+	}
+
+	for _, tool := range tools {
+		if tool.Type != candidate.Type {
+			continue
+		}
+		name := chatToolName(tool)
+		if name != "" && name == candidateName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func chatToolName(tool llm.Tool) string {
+	switch tool.Type {
+	case llm.ToolTypeFunction:
+		return tool.Function.Name
+	case llm.ToolTypeResponsesCustomTool:
+		if tool.ResponseCustomTool != nil {
+			return tool.ResponseCustomTool.Name
+		}
+	case "custom":
+		if tool.OpenAIChatCustomTool != nil {
+			return tool.OpenAIChatCustomTool.Name
+		}
+	}
+
+	return ""
 }
 
 // TransformResponse transforms Response to ChatCompletionResponse.
@@ -288,7 +435,9 @@ func (t *OutboundTransformer) TransformResponse(
 	}
 
 	// Convert to unified llm.Response
-	return oaiResp.ToLLMResponse(), nil
+	llmResp := oaiResp.ToLLMResponse()
+	shared.MergeResponseMetadata(llmResp, httpResp)
+	return llmResp, nil
 }
 
 func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclient.Request, stream streams.Stream[*httpclient.StreamEvent]) (streams.Stream[*llm.Response], error) {
@@ -305,14 +454,16 @@ func (t *OutboundTransformer) TransformStream(ctx context.Context, req *httpclie
 		}
 	}
 
-	// Wrap with NoNil to filter out non-standard events (e.g. inference-cost, cost)
-	// that TransformStreamChunk skips by returning nil.
-	//
-	// Note: TransformStreamChunk only returns nil for events with explicit "choices":[]
-	// in the raw JSON. Events without a choices key (nil slice) are passed through.
-	return streams.NoNil(streams.MapErr(stream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
+	// TransformStreamChunk deliberately returns nil for explicit non-standard
+	// events with choices:[] (for example inference-cost). Filter only those
+	// nil chunks, then retain request metadata propagation for valid chunks.
+	s := streams.NoNil(streams.MapErr(stream, func(event *httpclient.StreamEvent) (*llm.Response, error) {
 		return t.TransformStreamChunk(ctx, event)
-	})), nil
+	}))
+	if req != nil && req.TransformerMetadata != nil {
+		s = shared.PropagateStreamMetadata(s, req.TransformerMetadata)
+	}
+	return s, nil
 }
 
 func (t *OutboundTransformer) TransformStreamChunk(

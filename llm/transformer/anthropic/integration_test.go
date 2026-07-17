@@ -112,7 +112,7 @@ func TestAnthropicTransformers_Integration(t *testing.T) {
 			name: "thinking with display omitted",
 			anthropicRequestJSON: `{
 				"model": "claude-sonnet-4-20250514",
-				"max_tokens": 4096,
+				"max_tokens": 12000,
 				"thinking": {
 					"type": "enabled",
 					"budget_tokens": 10000,
@@ -126,7 +126,7 @@ func TestAnthropicTransformers_Integration(t *testing.T) {
 				]
 			}`,
 			expectedModel:           "claude-sonnet-4-20250514",
-			expectedMaxTokens:       4096,
+			expectedMaxTokens:       12000,
 			expectedThinkingDisplay: "omitted",
 		},
 		{
@@ -355,8 +355,8 @@ func TestAnthropicTransformResponse_CitationRoundTripIntegration(t *testing.T) {
 	require.Equal(t, "url_citation", citation.Type)
 	require.Equal(t, "https://example.com/anthropic", citation.URL)
 	require.Equal(t, "Anthropic Source", citation.Title)
-	require.Nil(t, citation.EncryptedIndex)
-	require.Nil(t, citation.CitedText)
+	require.Equal(t, "secret-index", lo.FromPtr(citation.EncryptedIndex))
+	require.Equal(t, "quoted text", lo.FromPtr(citation.CitedText))
 }
 
 func TestAnthropicTransformResponse_WebSearchBlocks_RoundTripIntegration(t *testing.T) {

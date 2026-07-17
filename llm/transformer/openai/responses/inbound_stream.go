@@ -42,9 +42,11 @@ type responsesInboundStream struct {
 	hasMessageItemStarted   bool
 	hasReasoningItemStarted bool
 	hasReasoningSummaryPart bool
+	hasReasoningTextPart    bool
 	hasContentPartStarted   bool
 	hasFinished             bool
 	responseCompleted       bool
+	terminalFinishReason    string
 	pendingAnnotations      []llm.Annotation
 
 	// Response metadata
@@ -68,7 +70,8 @@ type responsesInboundStream struct {
 	toolCalls           map[int]*llm.ToolCall
 	currentToolCallIdx  int
 	toolCallItemStarted map[int]bool
-	toolCallOutputIndex map[int]int // Maps tool call index to output index
+	toolCallOutputIndex map[int]int    // Maps tool call index to output index
+	toolCallItemIDs     map[int]string // Stable Responses output item ids per tool-call index
 
 	// Response accumulation using streamAggregator
 	usage               *llm.Usage
@@ -125,21 +128,8 @@ func (s *responsesInboundStream) Next() bool {
 	// Try to get the next chunk from source
 	if !s.source.Next() {
 		if s.err == nil && !s.errorEventEmitted && s.source.Err() == nil && s.hasFinished && !s.responseCompleted {
-			s.responseCompleted = true
-			s.aggregator.status = "completed"
-			response := s.aggregator.buildResponse()
-			if s.usage != nil {
-				response.Usage = ConvertLLMUsageToResponsesUsage(s.usage)
-			}
-			if calls := getResponseWebSearchCallsFromMetadata(s.transformerMetadata); len(calls) > 0 {
-				response.Output = append(append([]Item(nil), calls...), response.Output...)
-			}
-
-			if err := s.enqueueEvent(&StreamEvent{
-				Type:     StreamEventTypeResponseCompleted,
-				Response: response,
-			}); err != nil {
-				s.err = fmt.Errorf("failed to enqueue response.completed event: %w", err)
+			if err := s.enqueueTerminalResponse(); err != nil {
+				s.err = fmt.Errorf("failed to enqueue terminal response event: %w", err)
 				return false
 			}
 
@@ -178,6 +168,10 @@ func (s *responsesInboundStream) Next() bool {
 	// Handle [DONE] marker
 	if chunk.Object == "[DONE]" {
 		return s.Next() // Try next chunk
+	}
+
+	if s.enqueueRawResponsesStreamEvents(chunk) {
+		return s.Next()
 	}
 
 	// Initialize response metadata from first chunk
@@ -285,6 +279,7 @@ func (s *responsesInboundStream) Next() bool {
 		// Handle finish reason
 		if choice.FinishReason != nil && !s.hasFinished {
 			s.hasFinished = true
+			s.terminalFinishReason = *choice.FinishReason
 
 			// Close any open content parts
 			if err := s.closeCurrentContentPart(); err != nil {
@@ -300,31 +295,71 @@ func (s *responsesInboundStream) Next() bool {
 		}
 	}
 
-	// Handle final usage chunk and complete response
-	if chunk.Usage != nil && s.hasFinished && !s.responseCompleted {
-		s.responseCompleted = true
-		s.usage = chunk.Usage
-
-		// Build final response using aggregator
-		s.aggregator.status = "completed"
-		response := s.aggregator.buildResponse()
-		response.Usage = ConvertLLMUsageToResponsesUsage(s.usage)
-		if calls := getResponseWebSearchCallsFromMetadata(s.transformerMetadata); len(calls) > 0 {
-			response.Output = append(append([]Item(nil), calls...), response.Output...)
-		}
-
-		err := s.enqueueEvent(&StreamEvent{
-			Type:     StreamEventTypeResponseCompleted,
-			Response: response,
-		})
-		if err != nil {
-			s.err = fmt.Errorf("failed to enqueue response.completed event: %w", err)
+	// Complete when finish has been observed. Prefer waiting for a later usage
+	// chunk when one is expected, but do not require usage: complete as soon as
+	// finish is known and either usage is already present or this chunk itself
+	// carries usage. Usage-less completion is finalized at stream end below.
+	if s.hasFinished && !s.responseCompleted && s.usage != nil {
+		if err := s.enqueueTerminalResponse(); err != nil {
+			s.err = fmt.Errorf("failed to enqueue terminal response event: %w", err)
 			return false
 		}
 	}
 
 	// Continue to the next event
 	return s.Next()
+}
+
+func (s *responsesInboundStream) enqueueTerminalResponse() error {
+	s.responseCompleted = true
+	eventType, status := responsesTerminalEvent(s.terminalFinishReason)
+	s.aggregator.status = status
+	response := s.aggregator.buildResponse()
+	if s.usage != nil {
+		response.Usage = ConvertLLMUsageToResponsesUsage(s.usage)
+	}
+	if calls := getResponseWebSearchCallsFromMetadata(s.transformerMetadata); len(calls) > 0 {
+		response.Output = append(append([]Item(nil), calls...), response.Output...)
+	}
+
+	return s.enqueueEvent(&StreamEvent{Type: eventType, Response: response})
+}
+
+func responsesTerminalEvent(finishReason string) (StreamEventType, string) {
+	switch finishReason {
+	case "length":
+		return StreamEventTypeResponseIncomplete, "incomplete"
+	case "error":
+		return StreamEventTypeResponseFailed, "failed"
+	case "cancelled", "canceled":
+		return StreamEventTypeResponseCancelled, "canceled"
+	default:
+		return StreamEventTypeResponseCompleted, "completed"
+	}
+}
+
+// enqueueRawResponsesStreamEvents replays only Responses-native events that
+// could not be represented by the canonical chunk model. They deliberately do
+// not enter the synthesized event aggregator or any cross-protocol adapter.
+func (s *responsesInboundStream) enqueueRawResponsesStreamEvents(chunk *llm.Response) bool {
+	if chunk == nil || chunk.ProviderExtensions == nil || chunk.ProviderExtensions.OpenAIResponses == nil ||
+		chunk.ProviderExtensions.OpenAIResponses.Response == nil {
+		return false
+	}
+	events := chunk.ProviderExtensions.OpenAIResponses.Response.RawStreamEvents
+	if len(events) == 0 {
+		return false
+	}
+	for _, event := range events {
+		if len(event.Raw) == 0 || event.Type == "" {
+			continue
+		}
+		s.eventQueue = append(s.eventQueue, &httpclient.StreamEvent{
+			Type: event.Type,
+			Data: append([]byte(nil), event.Raw...),
+		})
+	}
+	return len(s.eventQueue) > 0
 }
 
 func (s *responsesInboundStream) mergeTransformerMetadata(metadata map[string]any) {
@@ -336,6 +371,21 @@ func (s *responsesInboundStream) mergeTransformerMetadata(metadata map[string]an
 		existingCalls := getResponseWebSearchCallsFromMetadata(s.transformerMetadata)
 		mergedCalls := append(existingCalls, calls...)
 		s.transformerMetadata[responsesWebSearchCallsTransformerMetadataKey] = mergedCalls
+	}
+	// Pass through the namespace tool map (established once during
+	// inbound request, does not need merging).
+	if raw, ok := metadata[responsesNamespaceToolMapTransformerMetadataKey]; ok && raw != nil {
+		s.transformerMetadata[responsesNamespaceToolMapTransformerMetadataKey] = raw
+	}
+	// Reasoning text stream preference / original content sidecar.
+	for _, key := range []string{
+		responsesReasoningPreferTextStreamTransformerMetadataKey,
+		responsesReasoningTextContentTransformerMetadataKey,
+		responsesReasoningSummaryContentTransformerMetadataKey,
+	} {
+		if raw, ok := metadata[key]; ok && raw != nil {
+			s.transformerMetadata[key] = raw
+		}
 	}
 }
 
@@ -371,7 +421,37 @@ func (s *responsesInboundStream) handleReasoningContent(content *string) error {
 		return err
 	}
 
-	// Start reasoning summary part only when we actually have summary text.
+	s.accumulatedReasoning.WriteString(*content)
+
+	emitReasoningText := false
+	if s.transformerMetadata != nil {
+		if _, ok := s.transformerMetadata[responsesReasoningTextContentTransformerMetadataKey]; ok {
+			emitReasoningText = true
+		}
+		if v, ok := s.transformerMetadata[responsesReasoningPreferTextStreamTransformerMetadataKey].(bool); ok && v {
+			emitReasoningText = true
+		}
+	}
+
+	if emitReasoningText {
+		if !s.hasReasoningTextPart {
+			s.hasReasoningTextPart = true
+		}
+		err := s.enqueueEvent(&StreamEvent{
+			Type:         StreamEventTypeReasoningTextDelta,
+			ItemID:       &s.currentItemID,
+			OutputIndex:  s.outputIndex,
+			ContentIndex: lo.ToPtr(0),
+			Delta:        *content,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to enqueue reasoning_text.delta event: %w", err)
+		}
+		// When protocol-native text stream is requested, skip summary-compat events.
+		return nil
+	}
+
+	// Default common path: emit reasoning_summary_* for existing fixtures/clients.
 	if !s.hasReasoningSummaryPart {
 		s.hasReasoningSummaryPart = true
 
@@ -387,10 +467,6 @@ func (s *responsesInboundStream) handleReasoningContent(content *string) error {
 		}
 	}
 
-	// Accumulate reasoning content
-	s.accumulatedReasoning.WriteString(*content)
-
-	// Emit reasoning_summary_text.delta
 	err := s.enqueueEvent(&StreamEvent{
 		Type:         StreamEventTypeReasoningSummaryTextDelta,
 		ItemID:       &s.currentItemID,
@@ -582,9 +658,10 @@ func (s *responsesInboundStream) handleToolCalls(toolCalls []llm.ToolCall) error
 			}
 		}
 
-		// Process delta based on tool type
+		// Process delta based on tool type. Chat custom calls use
+		// OpenAIChatCustomToolCall; bridge them onto the Responses custom path.
 		switch {
-		case tc.ResponseCustomToolCall != nil:
+		case tc.ResponseCustomToolCall != nil || tc.OpenAIChatCustomToolCall != nil:
 			if err := s.handleCustomToolCallDelta(tc); err != nil {
 				return err
 			}
@@ -609,11 +686,24 @@ func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
 		return err
 	}
 
+	// Bridge Chat-native custom calls into the Responses custom carrier used by
+	// stream state. Preserve ResponseCustomToolCall when already present.
+	customCall := tc.ResponseCustomToolCall
+	if customCall == nil && tc.OpenAIChatCustomToolCall != nil {
+		customCall = &llm.ResponseCustomToolCall{
+			CallID: tc.ID,
+			Name:   tc.OpenAIChatCustomToolCall.Name,
+			Input:  "",
+		}
+	}
+
 	s.toolCalls[toolCallIndex] = &llm.ToolCall{
-		Index:                  toolCallIndex,
-		ID:                     tc.ID,
-		Type:                   tc.Type,
-		ResponseCustomToolCall: tc.ResponseCustomToolCall,
+		Index:                    toolCallIndex,
+		ID:                       tc.ID,
+		Type:                     tc.Type,
+		ResponseItemID:           tc.ResponseItemID,
+		ResponseCustomToolCall:   customCall,
+		OpenAIChatCustomToolCall: tc.OpenAIChatCustomToolCall,
 		Function: llm.FunctionCall{
 			Name:      tc.Function.Name,
 			Namespace: tc.Function.Namespace,
@@ -621,20 +711,18 @@ func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
 		},
 	}
 
-	itemID := tc.ID
-	if itemID == "" {
-		itemID = generateItemID()
-	}
+	itemID := s.resolveToolCallItemID(toolCallIndex, tc)
 
 	switch {
-	case tc.ResponseCustomToolCall != nil:
+	case customCall != nil:
 		item := &Item{
-			ID:     itemID,
-			Type:   "custom_tool_call",
-			Status: lo.ToPtr("in_progress"),
-			CallID: tc.ResponseCustomToolCall.CallID,
-			Name:   tc.ResponseCustomToolCall.Name,
-			Input:  lo.ToPtr(""),
+			ID:        itemID,
+			Type:      "custom_tool_call",
+			Status:    lo.ToPtr("in_progress"),
+			CallID:    customCall.CallID,
+			Name:      customCall.Name,
+			Namespace: customCall.Namespace,
+			Input:     lo.ToPtr(""),
 		}
 
 		err := s.enqueueEvent(&StreamEvent{
@@ -647,13 +735,16 @@ func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
 		}
 
 	default:
+		// Restore namespace group identity via table lookup (never string
+		// splitting — group names may contain "__").
+		fcName, fcNamespace := resolveNamespaceFromMetadata(s.transformerMetadata, tc.Function.Name)
 		item := &Item{
 			ID:        itemID,
 			Type:      "function_call",
 			Status:    lo.ToPtr("in_progress"),
 			CallID:    tc.ID,
-			Name:      tc.Function.Name,
-			Namespace: tc.Function.Namespace,
+			Name:      fcName,
+			Namespace: fcNamespace,
 		}
 
 		err := s.enqueueEvent(&StreamEvent{
@@ -674,15 +765,46 @@ func (s *responsesInboundStream) initToolCall(tc llm.ToolCall) error {
 	return nil
 }
 
+// resolveToolCallItemID returns the stable Responses output item id for a tool
+// call. When the source has no ResponseItemID, allocate once via generateItemID
+// and reuse it for later delta/done events. Never alias item id to call_id.
+func (s *responsesInboundStream) resolveToolCallItemID(toolCallIndex int, tc llm.ToolCall) string {
+	if s.toolCallItemIDs == nil {
+		s.toolCallItemIDs = make(map[int]string)
+	}
+	if itemID, ok := s.toolCallItemIDs[toolCallIndex]; ok && itemID != "" {
+		return itemID
+	}
+	itemID := tc.ResponseItemID
+	if itemID == "" {
+		itemID = generateItemID()
+	}
+	s.toolCallItemIDs[toolCallIndex] = itemID
+	return itemID
+}
+
+// toolCallItemID looks up the stable item id for an already-initialized tool call.
+func (s *responsesInboundStream) toolCallItemID(toolCallIndex int, tc *llm.ToolCall) string {
+	if s.toolCallItemIDs != nil {
+		if itemID, ok := s.toolCallItemIDs[toolCallIndex]; ok && itemID != "" {
+			return itemID
+		}
+	}
+	if tc != nil && tc.ResponseItemID != "" {
+		return tc.ResponseItemID
+	}
+	if s.currentItemID != "" {
+		return s.currentItemID
+	}
+	return generateItemID()
+}
+
 func (s *responsesInboundStream) handleFunctionCallDelta(tc llm.ToolCall) error {
 	toolCallIndex := tc.Index
 	s.toolCalls[toolCallIndex].Function.Arguments += tc.Function.Arguments
 
 	if tc.Function.Arguments != "" {
-		itemID := s.toolCalls[toolCallIndex].ID
-		if itemID == "" {
-			itemID = s.currentItemID
-		}
+		itemID := s.toolCallItemID(toolCallIndex, s.toolCalls[toolCallIndex])
 
 		err := s.enqueueEvent(&StreamEvent{
 			Type:         StreamEventTypeFunctionCallArgumentsDelta,
@@ -701,19 +823,37 @@ func (s *responsesInboundStream) handleFunctionCallDelta(tc llm.ToolCall) error 
 
 func (s *responsesInboundStream) handleCustomToolCallDelta(tc llm.ToolCall) error {
 	toolCallIndex := tc.Index
-	s.toolCalls[toolCallIndex].ResponseCustomToolCall.Input += tc.ResponseCustomToolCall.Input
-
-	if tc.ResponseCustomToolCall.Input != "" {
-		itemID := s.toolCalls[toolCallIndex].ID
-		if itemID == "" {
-			itemID = s.currentItemID
+	tracked := s.toolCalls[toolCallIndex]
+	if tracked.ResponseCustomToolCall == nil {
+		// Defensive: initToolCall should have bridged Chat custom calls already.
+		callID := tracked.ID
+		name := ""
+		if tc.OpenAIChatCustomToolCall != nil {
+			name = tc.OpenAIChatCustomToolCall.Name
 		}
+		tracked.ResponseCustomToolCall = &llm.ResponseCustomToolCall{
+			CallID: callID,
+			Name:   name,
+		}
+	}
+
+	deltaInput := ""
+	switch {
+	case tc.ResponseCustomToolCall != nil:
+		deltaInput = tc.ResponseCustomToolCall.Input
+	case tc.OpenAIChatCustomToolCall != nil:
+		deltaInput = tc.OpenAIChatCustomToolCall.Input
+	}
+	tracked.ResponseCustomToolCall.Input += deltaInput
+
+	if deltaInput != "" {
+		itemID := s.toolCallItemID(toolCallIndex, tracked)
 
 		err := s.enqueueEvent(&StreamEvent{
 			Type:        StreamEventTypeCustomToolCallInputDelta,
 			ItemID:      &itemID,
 			OutputIndex: s.toolCallOutputIndex[toolCallIndex],
-			Delta:       tc.ResponseCustomToolCall.Input,
+			Delta:       deltaInput,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to enqueue custom_tool_call_input.delta event: %w", err)
@@ -731,6 +871,20 @@ func (s *responsesInboundStream) closeReasoningItem() error {
 	s.hasReasoningItemStarted = false
 	fullReasoning := s.accumulatedReasoning.String()
 	hadSummaryPart := s.hasReasoningSummaryPart
+	hadTextPart := s.hasReasoningTextPart
+
+	if hadTextPart {
+		err := s.enqueueEvent(&StreamEvent{
+			Type:         StreamEventTypeReasoningTextDone,
+			ItemID:       &s.currentItemID,
+			OutputIndex:  s.outputIndex,
+			ContentIndex: lo.ToPtr(0),
+			Text:         fullReasoning,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to enqueue reasoning_text.done event: %w", err)
+		}
+	}
 
 	// Emit reasoning summary done events only if we started the summary part.
 	if hadSummaryPart {
@@ -763,6 +917,7 @@ func (s *responsesInboundStream) closeReasoningItem() error {
 	}
 
 	s.hasReasoningSummaryPart = false
+	s.hasReasoningTextPart = false
 
 	// Emit output_item.done with complete reasoning item
 	var encryptedContent *string
@@ -785,8 +940,15 @@ func (s *responsesInboundStream) closeReasoningItem() error {
 	item := Item{
 		ID:               s.currentItemID,
 		Type:             "reasoning",
+		Status:           lo.ToPtr("completed"),
 		Summary:          summary,
 		EncryptedContent: encryptedContent,
+	}
+	if hadTextPart && fullReasoning != "" {
+		item.ReasoningContent = []ReasoningContent{{
+			Type: "reasoning_text",
+			Text: fullReasoning,
+		}}
 	}
 
 	err := s.enqueueEvent(&StreamEvent{
@@ -918,10 +1080,7 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 			continue
 		}
 
-		itemID := tc.ID
-		if itemID == "" {
-			itemID = s.currentItemID
-		}
+		itemID := s.toolCallItemID(idx, tc)
 
 		switch {
 		case tc.ResponseCustomToolCall != nil:
@@ -938,13 +1097,18 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 				return fmt.Errorf("failed to enqueue custom_tool_call_input.done event: %w", err)
 			}
 
+			ctcDoneStatus := tc.Status
+			if ctcDoneStatus == "" {
+				ctcDoneStatus = "completed"
+			}
 			item := Item{
-				ID:     itemID,
-				Type:   "custom_tool_call",
-				Status: lo.ToPtr("completed"),
-				CallID: tc.ResponseCustomToolCall.CallID,
-				Name:   tc.ResponseCustomToolCall.Name,
-				Input:  lo.ToPtr(fullInput),
+				ID:        itemID,
+				Type:      "custom_tool_call",
+				Status:    lo.ToPtr(ctcDoneStatus),
+				CallID:    tc.ResponseCustomToolCall.CallID,
+				Name:      tc.ResponseCustomToolCall.Name,
+				Namespace: tc.ResponseCustomToolCall.Namespace,
+				Input:     lo.ToPtr(fullInput),
 			}
 
 			err = s.enqueueEvent(&StreamEvent{
@@ -968,13 +1132,19 @@ func (s *responsesInboundStream) closeCurrentOutputItem() error {
 				return fmt.Errorf("failed to enqueue function_call_arguments.done event: %w", err)
 			}
 
+			fcDoneStatus := tc.Status
+			if fcDoneStatus == "" {
+				fcDoneStatus = "completed"
+			}
+			// Restore namespace group identity (consistent with initToolCall).
+			fcDoneName, fcDoneNamespace := resolveNamespaceFromMetadata(s.transformerMetadata, tc.Function.Name)
 			item := Item{
 				ID:        itemID,
 				Type:      "function_call",
-				Status:    lo.ToPtr("completed"),
+				Status:    lo.ToPtr(fcDoneStatus),
 				CallID:    tc.ID,
-				Name:      tc.Function.Name,
-				Namespace: tc.Function.Namespace,
+				Name:      fcDoneName,
+				Namespace: fcDoneNamespace,
 				Arguments: tc.Function.Arguments,
 			}
 

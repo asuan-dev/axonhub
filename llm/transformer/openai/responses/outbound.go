@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"net/http"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 
@@ -28,9 +28,8 @@ var (
 
 // Config holds all configuration for the OpenAI Responses outbound transformer.
 const (
-	TransportHTTP       = "http"
-	TransportWebSocket  = "websocket"
-	ResponsesLiteHeader = "X-OpenAI-Internal-Codex-Responses-Lite"
+	TransportHTTP      = "http"
+	TransportWebSocket = "websocket"
 )
 
 type Config struct {
@@ -219,35 +218,79 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 	apiKey := t.config.APIKeyProvider.Get(ctx)
 
 	var tools []Tool
+	hasUnsupportedGoogleCodeExecution := false
+	hasUnsupportedGoogleURLContext := false
+	hasUnsupportedCustomWithoutShape := false
+	hasUnsupportedUnknownTool := false
 	// Convert tools to Responses API format
 	for _, item := range llmReq.Tools {
 		switch item.Type {
 		case llm.ToolTypeImageGeneration:
 			tool := convertImageGenerationToTool(item)
-			if action := xmap.GetStringPtr(llmReq.TransformerMetadata, "image_generation_action"); action != nil {
+			if action := xmap.GetStringPtr(llmReq.TransformerMetadata, responsesImageGenActionTransformerMetadataKey); action != nil {
 				tool.Action = *action
 			}
 			tools = append(tools, tool)
 			// Store image output format in TransformerMetadata
-			llmReq.TransformerMetadata["image_output_format"] = tool.OutputFormat
+			llmReq.TransformerMetadata[responsesImageOutputFormatTransformerMetadataKey] = tool.OutputFormat
 		case llm.ToolTypeWebSearch, llm.ToolTypeGoogleSearch:
 			tool := convertWebSearchToTool(item)
 			tools = append(tools, tool)
 		case llm.ToolTypeResponsesCustomTool:
 			tool := convertCustomToTool(item)
 			tools = append(tools, tool)
+		case "custom":
+			// Explicit Chat→Responses custom tool declaration bridge.
+			if item.OpenAIChatCustomTool == nil {
+				hasUnsupportedCustomWithoutShape = true
+				continue
+			}
+			tool := convertChatCustomToTool(item)
+			tools = append(tools, tool)
 		case "function":
 			tool := convertFunctionToTool(item)
 			tools = append(tools, tool)
+		case llm.ToolTypeGoogleCodeExecution:
+			hasUnsupportedGoogleCodeExecution = true
+		case llm.ToolTypeGoogleUrlContext:
+			hasUnsupportedGoogleURLContext = true
 		default:
-			// Skip unsupported tool types
+			// Omit tool types with no Responses declaration mapping.
+			hasUnsupportedUnknownTool = true
 			continue
 		}
 	}
-
+	recordResponsesUnsupportedToolLossyDowngrades(
+		llmReq,
+		hasUnsupportedGoogleCodeExecution,
+		hasUnsupportedGoogleURLContext,
+		hasUnsupportedCustomWithoutShape,
+		hasUnsupportedUnknownTool,
+	)
+	chatRawRepresentedFields := map[string]bool{}
+	if webSearchTool, unknownFields := chatWebSearchOptionsForResponses(llmReq); webSearchTool != nil {
+		tools = mergeChatWebSearchOptionsIntoResponsesTools(tools, *webSearchTool)
+		chatRawRepresentedFields["web_search_options"] = true
+		for _, field := range unknownFields {
+			llm.AddLossyDowngradeIfPresent(
+				llmReq,
+				llm.APIFormatOpenAIChatCompletion,
+				field,
+				llm.APIFormatOpenAIResponse,
+				true,
+			)
+		}
+	}
+	promptCacheRetention := openAIResponsesRequestPromptCacheRetention(llmReq)
+	if promptCacheRetention == nil {
+		if bridged, ok := chatPromptCacheRetentionForResponses(llmReq); ok {
+			promptCacheRetention = bridged
+			chatRawRepresentedFields["prompt_cache_retention"] = true
+		}
+	}
 	payload := Request{
 		Model:                llmReq.Model,
-		Input:                convertInputFromMessages(llmReq.Messages, llmReq.TransformOptions),
+		Input:                convertInputFromMessages(llmReq.Messages, llmReq.TransformOptions, llmReq.TransformerMetadata),
 		Instructions:         convertInstructionsFromMessages(llmReq.Messages),
 		Tools:                tools,
 		ParallelToolCalls:    llmReq.ParallelToolCalls,
@@ -259,17 +302,23 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		User:                 llmReq.User,
 		Metadata:             llmReq.Metadata,
 		MaxOutputTokens:      llmReq.MaxCompletionTokens,
+		Temperature:          llmReq.Temperature,
+		FrequencyPenalty:     llmReq.FrequencyPenalty,
+		PresencePenalty:      llmReq.PresencePenalty,
 		TopLogprobs:          llmReq.TopLogprobs,
 		TopP:                 llmReq.TopP,
+		TopK:                 xmap.GetInt64Ptr(llmReq.TransformerMetadata, shared.TransformerMetadataKeyTopK),
+		CacheControl:         restoreCacheControl(llmReq.TransformerMetadata),
 		ToolChoice:           convertToolChoice(llmReq.ToolChoice),
-		StreamOptions:        convertStreamOptions(llmReq.StreamOptions, llmReq.TransformerMetadata),
+		StreamOptions:        convertStreamOptions(openAIResponsesRequestRawStreamOptions(llmReq)),
 		Reasoning:            convertReasoning(llmReq),
 		PromptCacheKey:       llmReq.PromptCacheKey,
 		PreviousResponseID:   llmReq.PreviousResponseID,
-		Include:              xmap.GetStringSlice(llmReq.TransformerMetadata, "include"),
-		MaxToolCalls:         xmap.GetInt64Ptr(llmReq.TransformerMetadata, "max_tool_calls"),
-		PromptCacheRetention: xmap.GetStringPtr(llmReq.TransformerMetadata, "prompt_cache_retention"),
-		Truncation:           xmap.GetStringPtr(llmReq.TransformerMetadata, "truncation"),
+		Include:              includeForResponsesOutbound(llmReq),
+		MaxToolCalls:         openAIResponsesRequestMaxToolCalls(llmReq),
+		PromptCacheRetention: promptCacheRetention,
+		Truncation:           openAIResponsesRequestTruncation(llmReq),
+		Background:           openAIResponsesRequestBackground(llmReq),
 	}
 
 	if lo.FromPtr(payload.PromptCacheKey) == "" {
@@ -278,11 +327,8 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		}
 	}
 
-	// Responses Lite requires an explicit false value, even when no top-level tools are sent.
-	if llmReq.RawRequest != nil && strings.EqualFold(strings.TrimSpace(llmReq.RawRequest.Headers.Get(ResponsesLiteHeader)), "true") {
-		payload.ParallelToolCalls = lo.ToPtr(false)
-	} else if len(payload.Tools) == 0 {
-		// Other Responses providers may reject parallel_tool_calls when tools are absent.
+	// Clear `parallel_tool_calls` when no tools are sent (Responses API compatibility).
+	if len(payload.Tools) == 0 {
 		payload.ParallelToolCalls = nil
 	}
 
@@ -305,7 +351,7 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 		return nil, err
 	}
 
-	return &httpclient.Request{
+	httpReq := &httpclient.Request{
 		Method:  http.MethodPost,
 		URL:     fullURL,
 		Headers: headers,
@@ -315,10 +361,293 @@ func (t *OutboundTransformer) TransformRequest(ctx context.Context, llmReq *llm.
 			APIKey: apiKey,
 		},
 		APIFormat:             string(llm.APIFormatOpenAIResponse),
-		TransformerMetadata:   llmReq.TransformerMetadata,
 		SkipInboundQueryMerge: true,
 		Metadata:              nil,
-	}, nil
+	}
+	recordResponsesChatNativeLossyDowngrades(llmReq, chatRawRepresentedFields)
+	shared.RecordAnthropicNativeLossyDowngradesForTarget(llmReq, llm.APIFormatOpenAIResponse)
+	shared.PropagateRequestMetadata(httpReq, llmReq)
+	return httpReq, nil
+}
+
+// recordResponsesUnsupportedToolLossyDowngrades records tool declarations that the
+// Responses outbound intentionally omits instead of faking an unsupported wire shape.
+func recordResponsesUnsupportedToolLossyDowngrades(
+	llmReq *llm.Request,
+	hasGoogleCodeExecution bool,
+	hasGoogleURLContext bool,
+	hasCustomWithoutShape bool,
+	hasUnknownTool bool,
+) {
+	if llmReq == nil {
+		return
+	}
+	sourceProtocol := llmReq.APIFormat
+	if sourceProtocol == "" {
+		sourceProtocol = llm.APIFormatOpenAIChatCompletion
+	}
+	llm.AddLossyDowngradeIfPresent(
+		llmReq,
+		sourceProtocol,
+		"tools[].type=google_code_execution",
+		llm.APIFormatOpenAIResponse,
+		hasGoogleCodeExecution,
+	)
+	llm.AddLossyDowngradeIfPresent(
+		llmReq,
+		sourceProtocol,
+		"tools[].type=google_url_context",
+		llm.APIFormatOpenAIResponse,
+		hasGoogleURLContext,
+	)
+	llm.AddLossyDowngradeIfPresent(
+		llmReq,
+		sourceProtocol,
+		"tools[].type=custom",
+		llm.APIFormatOpenAIResponse,
+		hasCustomWithoutShape,
+	)
+	llm.AddLossyDowngradeIfPresent(
+		llmReq,
+		sourceProtocol,
+		"tools[] unsupported type",
+		llm.APIFormatOpenAIResponse,
+		hasUnknownTool,
+	)
+}
+
+// recordResponsesChatNativeLossyDowngrades records explicit Chat→Responses field
+// losses that the Responses payload cannot represent. Allowlisted only.
+func recordResponsesChatNativeLossyDowngrades(llmReq *llm.Request, chatRawRepresentedFields map[string]bool) {
+	if llmReq == nil {
+		return
+	}
+	// seed is Chat-native and has no Responses request equivalent.
+	if llmReq.APIFormat == llm.APIFormatOpenAIChatCompletion {
+		llm.AddLossyDowngradeIfPresent(
+			llmReq,
+			llm.APIFormatOpenAIChatCompletion,
+			"seed",
+			llm.APIFormatOpenAIResponse,
+			llmReq.Seed != nil,
+		)
+		llm.AddLossyDowngradeIfPresent(
+			llmReq,
+			llm.APIFormatOpenAIChatCompletion,
+			"stop",
+			llm.APIFormatOpenAIResponse,
+			llmReq.Stop != nil && (llmReq.Stop.Stop != nil || len(llmReq.Stop.MultipleStop) > 0),
+		)
+		llm.AddLossyDowngradeIfPresent(
+			llmReq,
+			llm.APIFormatOpenAIChatCompletion,
+			"logit_bias",
+			llm.APIFormatOpenAIResponse,
+			len(llmReq.LogitBias) > 0,
+		)
+		llm.AddLossyDowngradeIfPresent(
+			llmReq,
+			llm.APIFormatOpenAIChatCompletion,
+			"stream_options.include_usage",
+			llm.APIFormatOpenAIResponse,
+			llmReq.StreamOptions != nil && llmReq.StreamOptions.IncludeUsage,
+		)
+		llm.AddLossyDowngradeIfPresent(
+			llmReq,
+			llm.APIFormatOpenAIChatCompletion,
+			"modalities",
+			llm.APIFormatOpenAIResponse,
+			hasNonTextModalities(llmReq.Modalities),
+		)
+	}
+	shared.RecordOpenAIChatRawRequestLossyDowngrades(llmReq, llm.APIFormatOpenAIResponse, chatRawRepresentedFields)
+}
+
+func hasNonTextModalities(modalities []string) bool {
+	for _, modality := range modalities {
+		if modality != "text" {
+			return true
+		}
+	}
+	return false
+}
+
+func includeForResponsesOutbound(llmReq *llm.Request) []string {
+	include := append([]string(nil), openAIResponsesRequestInclude(llmReq)...)
+	if llmReq == nil || llmReq.APIFormat != llm.APIFormatOpenAIChatCompletion || llmReq.Logprobs == nil || !*llmReq.Logprobs {
+		return include
+	}
+	for _, value := range include {
+		if value == "message.output_text.logprobs" {
+			return include
+		}
+	}
+	return append(include, "message.output_text.logprobs")
+}
+
+func chatPromptCacheRetentionForResponses(llmReq *llm.Request) (*string, bool) {
+	if llmReq == nil || llmReq.APIFormat != llm.APIFormatOpenAIChatCompletion || llmReq.RawRequest == nil {
+		return nil, false
+	}
+	var source struct {
+		PromptCacheRetention *string `json:"prompt_cache_retention"`
+	}
+	if json.Unmarshal(llmReq.RawRequest.Body, &source) != nil || source.PromptCacheRetention == nil {
+		return nil, false
+	}
+	switch *source.PromptCacheRetention {
+	case "in_memory", "24h":
+		return source.PromptCacheRetention, true
+	default:
+		return nil, false
+	}
+}
+
+// chatWebSearchOptionsForResponses adapts the Chat-only web-search wrapper to
+// the equivalent Responses web_search tool. It keeps unknown source members
+// separate so the target boundary can report only the residual loss.
+func chatWebSearchOptionsForResponses(llmReq *llm.Request) (*Tool, []string) {
+	if llmReq == nil || llmReq.APIFormat != llm.APIFormatOpenAIChatCompletion || llmReq.RawRequest == nil {
+		return nil, nil
+	}
+
+	var source map[string]json.RawMessage
+	if json.Unmarshal(llmReq.RawRequest.Body, &source) != nil {
+		return nil, nil
+	}
+	rawOptions, ok := source["web_search_options"]
+	if !ok || string(rawOptions) == "null" {
+		return nil, nil
+	}
+
+	var optionFields map[string]json.RawMessage
+	if json.Unmarshal(rawOptions, &optionFields) != nil || optionFields == nil {
+		return nil, nil
+	}
+
+	tool := &Tool{Type: "web_search"}
+	unknownFields := make([]string, 0)
+	for field, rawValue := range optionFields {
+		switch field {
+		case "search_context_size":
+			var searchContextSize string
+			if json.Unmarshal(rawValue, &searchContextSize) != nil || !isSupportedWebSearchContextSize(searchContextSize) {
+				unknownFields = append(unknownFields, "web_search_options.search_context_size")
+				continue
+			}
+			tool.SearchContextSize = searchContextSize
+		case "user_location":
+			location, locationUnknownFields, ok := chatWebSearchLocationForResponses(rawValue)
+			if !ok {
+				unknownFields = append(unknownFields, "web_search_options.user_location")
+				continue
+			}
+			tool.UserLocation = location
+			unknownFields = append(unknownFields, locationUnknownFields...)
+		default:
+			unknownFields = append(unknownFields, "web_search_options."+field)
+		}
+	}
+	sort.Strings(unknownFields)
+	return tool, unknownFields
+}
+
+func isSupportedWebSearchContextSize(value string) bool {
+	switch value {
+	case "low", "medium", "high":
+		return true
+	default:
+		return false
+	}
+}
+
+func chatWebSearchLocationForResponses(rawLocation json.RawMessage) (*WebSearchUserLocation, []string, bool) {
+	if string(rawLocation) == "null" {
+		return nil, nil, true
+	}
+
+	var locationFields map[string]json.RawMessage
+	if json.Unmarshal(rawLocation, &locationFields) != nil || locationFields == nil {
+		return nil, nil, false
+	}
+
+	rawType, ok := locationFields["type"]
+	if !ok {
+		return nil, []string{"web_search_options.user_location.type"}, true
+	}
+	var locationType string
+	if json.Unmarshal(rawType, &locationType) != nil || locationType != "approximate" {
+		return nil, []string{"web_search_options.user_location.type"}, true
+	}
+
+	location := &WebSearchUserLocation{Type: locationType}
+	unknownFields := make([]string, 0)
+	for field, rawValue := range locationFields {
+		switch field {
+		case "type":
+			continue
+		case "approximate":
+			approximateUnknownFields, ok := populateChatWebSearchApproximateLocation(location, rawValue)
+			if !ok {
+				unknownFields = append(unknownFields, "web_search_options.user_location.approximate")
+				continue
+			}
+			unknownFields = append(unknownFields, approximateUnknownFields...)
+		default:
+			unknownFields = append(unknownFields, "web_search_options.user_location."+field)
+		}
+	}
+	return location, unknownFields, true
+}
+
+func populateChatWebSearchApproximateLocation(location *WebSearchUserLocation, rawApproximate json.RawMessage) ([]string, bool) {
+	if string(rawApproximate) == "null" {
+		return nil, true
+	}
+
+	var approximateFields map[string]json.RawMessage
+	if json.Unmarshal(rawApproximate, &approximateFields) != nil || approximateFields == nil {
+		return nil, false
+	}
+
+	unknownFields := make([]string, 0)
+	for field, rawValue := range approximateFields {
+		var target *string
+		switch field {
+		case "city":
+			target = &location.City
+		case "country":
+			target = &location.Country
+		case "region":
+			target = &location.Region
+		case "timezone":
+			target = &location.Timezone
+		default:
+			unknownFields = append(unknownFields, "web_search_options.user_location.approximate."+field)
+			continue
+		}
+		if json.Unmarshal(rawValue, target) != nil {
+			unknownFields = append(unknownFields, "web_search_options.user_location.approximate."+field)
+		}
+	}
+	return unknownFields, true
+}
+
+func mergeChatWebSearchOptionsIntoResponsesTools(tools []Tool, source Tool) []Tool {
+	for index := range tools {
+		if tools[index].Type != "web_search" {
+			continue
+		}
+		if tools[index].SearchContextSize == "" {
+			tools[index].SearchContextSize = source.SearchContextSize
+		}
+		if tools[index].UserLocation == nil && source.UserLocation != nil {
+			location := *source.UserLocation
+			tools[index].UserLocation = &location
+		}
+		return tools
+	}
+	return append(tools, source)
 }
 
 // buildFullRequestURL constructs the appropriate URL based on the platform.
@@ -389,14 +718,34 @@ func (t *OutboundTransformer) transformStandardResponse(
 		TransformerMetadata: map[string]any{},
 	}
 
+	if resp.ServiceTier != nil {
+		llmResp.ServiceTier = *resp.ServiceTier
+	}
+	if resp.Error != nil {
+		llmResp.Error = &llm.ResponseError{
+			Detail: llm.ErrorDetail{
+				Type:    resp.Error.Type,
+				Code:    resp.Error.Code,
+				Message: resp.Error.Message,
+			},
+		}
+	}
+
 	// Convert usage if present
 	if resp.Usage != nil {
 		llmResp.Usage = resp.Usage.ToUsage()
 	}
 
-	if httpResp.Request != nil && httpResp.Request.TransformerMetadata != nil {
-		llmResp.TransformerMetadata = maps.Clone(httpResp.Request.TransformerMetadata)
+	captureOpenAIResponsesResponseTopLevelFields(httpResp.Body, llmResp)
+	if resp.Status != nil && (*resp.Status == "queued" || *resp.Status == "in_progress") {
+		llm.EnsureOpenAIResponsesResponseExtensions(llmResp).Status = lo.ToPtr(*resp.Status)
 	}
+	if rawOutputItems := rawOnlyResponsesOutputItems(httpResp.Body); len(rawOutputItems) > 0 {
+		ext := llm.EnsureOpenAIResponsesResponseExtensions(llmResp)
+		ext.RawOutputItems = rawOutputItems
+	}
+
+	shared.MergeResponseMetadata(llmResp, httpResp)
 
 	msg := convertOutputToMessage(resp.Output, llmResp.TransformerMetadata)
 
@@ -439,4 +788,75 @@ func (t *OutboundTransformer) transformStandardResponse(
 	}
 
 	return llmResp, nil
+}
+
+var openAIResponsesRawResponseTopLevelFields = [...]string{"completed_at", "output_text", "incomplete_details"}
+
+func captureOpenAIResponsesResponseTopLevelFields(body []byte, llmResp *llm.Response) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return
+	}
+
+	var captured map[string]json.RawMessage
+	for _, field := range openAIResponsesRawResponseTopLevelFields {
+		raw, ok := envelope[field]
+		if !ok {
+			continue
+		}
+		if captured == nil {
+			captured = make(map[string]json.RawMessage)
+		}
+		captured[field] = append(json.RawMessage(nil), raw...)
+	}
+	if len(captured) == 0 {
+		return
+	}
+
+	ext := llm.EnsureOpenAIResponsesResponseExtensions(llmResp)
+	if ext.RawTopLevelFields == nil {
+		ext.RawTopLevelFields = make(map[string]json.RawMessage)
+	}
+	for field, raw := range captured {
+		ext.RawTopLevelFields[field] = raw
+	}
+}
+
+// rawOnlyResponsesOutputItems extracts output[] members that the canonical
+// response model cannot represent. Raw replay is same-Responses only and
+// preserves original ordering through OriginalIndex.
+func rawOnlyResponsesOutputItems(body []byte) []llm.OpenAIResponsesRawFragment {
+	var envelope struct {
+		Output []json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil
+	}
+
+	fragments := make([]llm.OpenAIResponsesRawFragment, 0)
+	for index, raw := range envelope.Output {
+		var probe struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &probe); err != nil || isStructurallyRepresentedResponsesOutputType(probe.Type) {
+			continue
+		}
+		fragments = append(fragments, llm.OpenAIResponsesRawFragment{
+			Type:          probe.Type,
+			OriginalIndex: index,
+			Raw:           append(json.RawMessage(nil), raw...),
+		})
+	}
+	return fragments
+}
+
+func isStructurallyRepresentedResponsesOutputType(itemType string) bool {
+	switch itemType {
+	case "message", "output_text", "function_call", "custom_tool_call", "reasoning",
+		"image_generation_call", "web_search_call", "compaction", "compaction_summary", "input_image":
+		return true
+	default:
+		return false
+	}
 }

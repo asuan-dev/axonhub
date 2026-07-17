@@ -31,7 +31,15 @@ func (t *OutboundTransformer) TransformStream(
 	doneEvent := lo.ToPtr(llm.DoneStreamEvent)
 	streamWithDone := streams.AppendStream(stream, doneEvent)
 
-	return streams.NoNil(newResponsesOutboundStream(streamWithDone)), nil
+	s := newResponsesOutboundStream(streamWithDone)
+	// Propagate request TransformerMetadata onto the first chunk so cross-protocol
+	// fields (e.g. the namespace tool map) survive the streaming round-trip,
+	// mirroring the other outbounds via shared.PropagateStreamMetadata.
+	var requestMetadata map[string]any
+	if req != nil {
+		requestMetadata = req.TransformerMetadata
+	}
+	return shared.PropagateStreamMetadata(streams.NoNil(s), requestMetadata), nil
 }
 
 // responsesOutboundStream wraps a stream and maintains state during processing.
@@ -267,9 +275,10 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				ID:   item.CallID,
 				Type: llm.ToolTypeResponsesCustomTool,
 				ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-					CallID: item.CallID,
-					Name:   item.Name,
-					Input:  "",
+					CallID:    item.CallID,
+					Name:      item.Name,
+					Namespace: item.Namespace,
+					Input:     "",
 				},
 			}
 			s.state.itemToCallID[item.ID] = item.CallID
@@ -285,8 +294,9 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 								Type:  llm.ToolTypeResponsesCustomTool,
 								Index: toolCallIdx,
 								ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-									CallID: item.CallID,
-									Name:   item.Name,
+									CallID:    item.CallID,
+									Name:      item.Name,
+									Namespace: item.Namespace,
 								},
 							},
 						},
@@ -368,9 +378,10 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 									Index: toolCallIdx,
 									Type:  llm.ToolTypeResponsesCustomTool,
 									ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-										CallID: callID,
-										Name:   tc.ResponseCustomToolCall.Name,
-										Input:  streamEvent.Delta,
+										CallID:    callID,
+										Name:      tc.ResponseCustomToolCall.Name,
+										Namespace: tc.ResponseCustomToolCall.Namespace,
+										Input:     streamEvent.Delta,
 									},
 								},
 							},
@@ -414,9 +425,19 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 			},
 		}
 
-	case StreamEventTypeReasoningSummaryTextDelta:
-		// Reasoning content delta
+	case StreamEventTypeReasoningSummaryTextDelta, StreamEventTypeReasoningTextDelta:
+		// Reasoning content delta (summary_text or reasoning_text).
 		s.state.reasoningContent.WriteString(streamEvent.Delta)
+		if streamEvent.Type == StreamEventTypeReasoningTextDelta {
+			if s.state.transformerMetadata == nil {
+				s.state.transformerMetadata = map[string]any{}
+			}
+			// Mark production origin so common→Responses re-emit uses reasoning_text.*.
+			s.state.transformerMetadata[responsesReasoningPreferTextStreamTransformerMetadataKey] = true
+			resp.TransformerMetadata = map[string]any{
+				responsesReasoningPreferTextStreamTransformerMetadataKey: true,
+			}
+		}
 
 		resp.Choices = []llm.Choice{
 			{
@@ -431,8 +452,14 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		// Text content completed - skip, content was already streamed via deltas
 		return nil // Intentionally skip this event
 
-	case StreamEventTypeReasoningSummaryTextDone:
+	case StreamEventTypeReasoningSummaryTextDone, StreamEventTypeReasoningTextDone:
 		// Reasoning content completed - skip, content was already streamed via deltas
+		if streamEvent.Type == StreamEventTypeReasoningTextDone {
+			if s.state.transformerMetadata == nil {
+				s.state.transformerMetadata = map[string]any{}
+			}
+			s.state.transformerMetadata[responsesReasoningPreferTextStreamTransformerMetadataKey] = true
+		}
 		return nil // Intentionally skip this event
 
 	case StreamEventTypeOutputItemDone:
@@ -453,15 +480,49 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 				encryptedContent = s.state.pendingReasoningEncryptedContent[streamEvent.Item.ID]
 			}
 			delete(s.state.pendingReasoningEncryptedContent, streamEvent.Item.ID)
-			if encryptedContent == nil || *encryptedContent == "" {
-				return nil // Intentionally skip this event
+
+			meta := map[string]any{
+				responsesReasoningItemTransformerMetadataKey: map[string]any{
+					"id":   streamEvent.Item.ID,
+					"done": true,
+				},
+			}
+			if len(streamEvent.Item.ReasoningContent) > 0 {
+				meta[responsesReasoningTextContentTransformerMetadataKey] = append([]ReasoningContent(nil), streamEvent.Item.ReasoningContent...)
+				meta[responsesReasoningPreferTextStreamTransformerMetadataKey] = true
+			}
+			if len(streamEvent.Item.Summary) > 0 {
+				meta[responsesReasoningSummaryContentTransformerMetadataKey] = append([]ReasoningSummary(nil), streamEvent.Item.Summary...)
+			}
+			// Keep production stream-state for later common→Responses re-emit.
+			if s.state.transformerMetadata == nil {
+				s.state.transformerMetadata = map[string]any{}
+			}
+			for k, v := range meta {
+				s.state.transformerMetadata[k] = v
 			}
 
+			if encryptedContent == nil || *encryptedContent == "" {
+				// Still emit metadata-only chunk when content origin is present.
+				if len(streamEvent.Item.ReasoningContent) == 0 {
+					return nil
+				}
+				resp.TransformerMetadata = cloneTransformerMetadata(meta)
+				resp.Choices = []llm.Choice{{Index: 0, Delta: &llm.Message{Role: "assistant"}}}
+				break
+			}
+
+			// Match historical golden fixtures: encrypted-only item.done carries only
+			// reasoning item id/done metadata, not accumulated stream-state keys.
 			resp.TransformerMetadata = map[string]any{
 				responsesReasoningItemTransformerMetadataKey: map[string]any{
 					"id":   streamEvent.Item.ID,
 					"done": true,
 				},
+			}
+			if len(streamEvent.Item.ReasoningContent) > 0 {
+				resp.TransformerMetadata[responsesReasoningTextContentTransformerMetadataKey] = append([]ReasoningContent(nil), streamEvent.Item.ReasoningContent...)
+				resp.TransformerMetadata[responsesReasoningPreferTextStreamTransformerMetadataKey] = true
 			}
 			resp.Choices = []llm.Choice{
 				{
@@ -482,7 +543,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 			return nil // Intentionally skip this event
 		}
 		if len(s.state.transformerMetadata) > 0 {
-			resp.TransformerMetadata = s.state.transformerMetadata
+			resp.TransformerMetadata = cloneTransformerMetadata(s.state.transformerMetadata)
 			s.state.transformerMetadataEmitted = true
 		}
 
@@ -508,7 +569,7 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 			resp.PreviousResponseID = s.state.previousResponseID
 		}
 		if len(s.state.transformerMetadata) > 0 && !s.state.transformerMetadataEmitted {
-			resp.TransformerMetadata = s.state.transformerMetadata
+			resp.TransformerMetadata = cloneTransformerMetadata(s.state.transformerMetadata)
 			s.state.transformerMetadataEmitted = true
 		}
 
@@ -621,13 +682,36 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		}
 
 	default:
-		// Unknown event type - skip
-		return nil // Intentionally skip this event
+		if isTransportOnlyResponsesStreamEvent(streamEvent.Type) {
+			// Known event families without a canonical behavior remain deliberately
+			// unsupported until their dedicated contract slice exists. Do not change
+			// the established Chat-facing stream sequence here.
+			return nil
+		}
+		// Preserve unsupported but syntactically valid Responses events as a
+		// same-protocol stream sidecar. Do not fabricate a generic llm chunk.
+		ext := llm.EnsureOpenAIResponsesResponseExtensions(resp)
+		ext.RawStreamEvents = append(ext.RawStreamEvents, llm.OpenAIResponsesRawStreamEvent{
+			Type: string(streamEvent.Type),
+			Raw:  append(json.RawMessage(nil), event.Data...),
+		})
+		s.enqueue(resp)
+		return nil
 	}
 
 	s.enqueue(resp)
 
 	return nil
+}
+
+func isTransportOnlyResponsesStreamEvent(eventType StreamEventType) bool {
+	switch eventType {
+	case "keepalive", "ping":
+		// Transport heartbeats have no protocol payload to preserve.
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *responsesOutboundStream) Current() *llm.Response {
@@ -659,4 +743,15 @@ func (t *OutboundTransformer) AggregateStreamChunks(
 	chunks []*httpclient.StreamEvent,
 ) ([]byte, llm.ResponseMeta, error) {
 	return AggregateStreamChunks(ctx, chunks)
+}
+
+func cloneTransformerMetadata(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }

@@ -1,25 +1,58 @@
 package anthropic
 
 import (
+	"encoding/json"
+	"fmt"
+
 	"github.com/samber/lo"
 
 	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
+	"github.com/looplj/axonhub/llm/transformer"
 	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // convertToAnthropicRequest converts ChatCompletionRequest to Anthropic MessageRequest.
 // Deprecated: Use convertToAnthropicRequestWithConfig instead.
-func convertToAnthropicRequest(chatReq *llm.Request) *MessageRequest {
+func convertToAnthropicRequest(chatReq *llm.Request) (*MessageRequest, error) {
 	return convertToAnthropicRequestWithConfig(chatReq, nil)
 }
 
-func convertToAnthropicRequestWithConfig(chatReq *llm.Request, config *Config) *MessageRequest {
-	req := buildBaseRequest(chatReq, config)
+func convertToAnthropicRequestWithConfig(chatReq *llm.Request, config *Config) (*MessageRequest, error) {
+	return convertToAnthropicRequestWithThinkingPlan(chatReq, config, resolveThinkingRequestPlan(chatReq, config))
+}
+
+func convertToAnthropicRequestWithThinkingPlan(
+	chatReq *llm.Request,
+	config *Config,
+	thinkingPlan thinkingRequestPlan,
+) (*MessageRequest, error) {
+	req := buildBaseRequest(chatReq, thinkingPlan)
 	req.Tools = convertToolsAnthropic(chatReq.Tools, config)
+	req.Tools = appendAnthropicRawTools(req.Tools, chatReq)
 	req.ToolChoice = convertToolChoiceToAnthropic(chatReq.ToolChoice)
-	req.Messages = convertMessages(chatReq, config)
+
+	// Map parallel_tool_calls (true=allow) inversely to Anthropic's
+	// disable_parallel_tool_use (true=disable), which nests inside tool_choice.
+	// Synthesize {type:"auto"} when the client expressed a parallel preference
+	// without setting tool_choice; skip when there are no tools (Anthropic
+	// requires tools for disable_parallel_tool_use) or tool_choice is "none".
+	// Use the final req.Tools (common + raw exclusive like mcp_toolset), not only
+	// chatReq.Tools, so raw-only tool declarations still preserve parallel control.
+	if len(req.Tools) > 0 && chatReq.ParallelToolCalls != nil {
+		if req.ToolChoice == nil {
+			req.ToolChoice = &ToolChoice{Type: "auto"}
+		}
+		if req.ToolChoice.Type != "none" {
+			req.ToolChoice.DisableParallelToolUse = lo.ToPtr(!*chatReq.ParallelToolCalls)
+		}
+	}
+	messages, err := convertMessages(hydrateAnthropicRawContent(chatReq), config)
+	if err != nil {
+		return nil, err
+	}
+	req.Messages = messages
 	req.StopSequences = convertStopSequences(chatReq.Stop)
 
 	// DeepSeek requires assistant messages in history to include a thinking block
@@ -28,7 +61,73 @@ func convertToAnthropicRequestWithConfig(chatReq *llm.Request, config *Config) *
 		ensureAssistantThinkingBlocks(req.Messages)
 	}
 
-	return req
+	// Prefer the full stashed OutputConfig (effort + format/task_budget) when the
+	// platform supports output_config. Effort-only conversion already lives in the
+	// thinking capability planner; this restores richer same-protocol fields.
+	if chatReq.TransformerMetadata != nil && supportsOutputConfig(config) {
+		if oc, ok := chatReq.TransformerMetadata[TransformerMetadataKeyOutputConfig].(*OutputConfig); ok && oc != nil {
+			req.OutputConfig = oc
+		}
+	}
+
+	return req, nil
+}
+
+// hydrateAnthropicRawContent materializes request-side raw fragments only in a
+// short-lived outbound copy. The canonical llm.Request keeps opaque Anthropic
+// bytes in ProviderExtensions rather than TransformerMetadata; existing block
+// builders can then reuse their ordered-content logic without making metadata
+// a persistent provider field bag.
+func hydrateAnthropicRawContent(chatReq *llm.Request) *llm.Request {
+	if chatReq == nil || chatReq.ProviderExtensions == nil || chatReq.ProviderExtensions.Anthropic == nil ||
+		chatReq.ProviderExtensions.Anthropic.Request == nil {
+		return chatReq
+	}
+
+	fragments := chatReq.ProviderExtensions.Anthropic.Request.RawContentFragments
+	if len(fragments) == 0 {
+		return chatReq
+	}
+
+	cloned := *chatReq
+	cloned.Messages = append([]llm.Message(nil), chatReq.Messages...)
+	for messageIndex := range cloned.Messages {
+		message := &cloned.Messages[messageIndex]
+		if len(message.Content.MultipleContent) == 0 {
+			continue
+		}
+
+		parts := append([]llm.MessageContentPart(nil), message.Content.MultipleContent...)
+		for partIndex := range parts {
+			part := &parts[partIndex]
+			if part.Type != "anthropic_raw_block" {
+				continue
+			}
+			for _, fragment := range fragments {
+				if fragment.MessageIndex != messageIndex || fragment.PartIndex != getAnthropicBlockIndex(part.TransformerMetadata) ||
+					fragment.NestedInToolResult != (message.Role == "tool") {
+					continue
+				}
+				part.TransformerMetadata = cloneAnthropicTransformerMetadata(part.TransformerMetadata)
+				setAnthropicRawBlock(&part.TransformerMetadata, fragment.Raw)
+				break
+			}
+		}
+		message.Content.MultipleContent = parts
+	}
+
+	return &cloned
+}
+
+func cloneAnthropicTransformerMetadata(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(src)+1)
+	for key, value := range src {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func isThinkingEnabled(req *MessageRequest) bool {
@@ -103,14 +202,14 @@ func prepareAnthropicReasoning(reasoningContent, reasoningSignature *string, con
 			return reasoningContent, decoded
 		}
 
-		return nil, nil
+		return reasoningContent, nil
 	}
 
 	return reasoningContent, reasoningSignature
 }
 
 // buildBaseRequest creates the base MessageRequest with common fields.
-func buildBaseRequest(chatReq *llm.Request, config *Config) *MessageRequest {
+func buildBaseRequest(chatReq *llm.Request, thinkingPlan thinkingRequestPlan) *MessageRequest {
 	req := &MessageRequest{
 		Model:       chatReq.Model,
 		Temperature: chatReq.Temperature,
@@ -120,39 +219,27 @@ func buildBaseRequest(chatReq *llm.Request, config *Config) *MessageRequest {
 		MaxTokens:   resolveMaxTokens(chatReq),
 	}
 
-	if chatReq.Metadata != nil && chatReq.Metadata["user_id"] != "" {
-		req.Metadata = &AnthropicMetadata{UserID: chatReq.Metadata["user_id"]}
+	// Restore service_tier so it survives non-pass-through format conversion.
+	if chatReq.ServiceTier != nil {
+		req.ServiceTier = *chatReq.ServiceTier
 	}
 
-	// DeepSeek Anthropic format supports output_config.effort. When reasoning_effort
-	// is present, prefer output_config over thinking so suffix-based effort routing
-	// (for example deepseek-chat-max) preserves the explicit effort level.
-	// Note: "none" is not a valid effort value, so skip it (it means disabled thinking).
-	if config != nil && config.Type == PlatformDeepSeek && chatReq.ReasoningEffort != "" && chatReq.ReasoningEffort != "none" {
-		req.OutputConfig = &OutputConfig{Effort: chatReq.ReasoningEffort}
+	// Identity: prefer anthropic-native metadata.user_id (authoritative for
+	// same-protocol round-trip); fall back to canonical.User so chat/responses
+	// -> anthropic routing preserves the user (#13 bridge).
+	userID := ""
+	if chatReq.Metadata != nil {
+		userID = chatReq.Metadata["user_id"]
+	}
+	if userID == "" && chatReq.User != nil {
+		userID = *chatReq.User
+	}
+	if userID != "" {
+		req.Metadata = &AnthropicMetadata{UserID: userID}
 	}
 
-	// Determine thinking config priority: disabled > adaptive > enabled
-	if chatReq.TransformerMetadata != nil {
-		if v, ok := chatReq.TransformerMetadata[TransformerMetadataKeyThinkingType].(string); ok {
-			switch v {
-			case "disabled":
-				req.Thinking = &Thinking{Type: "disabled"}
-			case "adaptive":
-				req.Thinking = &Thinking{Type: "adaptive"}
-			}
-		}
-	}
-
-	// Handle ReasoningEffort="none" as disabled thinking (e.g., from OpenAI inbound)
-	// This check is needed when TransformerMetadata is not set but ReasoningEffort is "none"
-	if req.Thinking == nil && chatReq.ReasoningEffort == "none" {
-		req.Thinking = &Thinking{Type: "disabled"}
-	}
-
-	if req.OutputConfig == nil && req.Thinking == nil && chatReq.ReasoningEffort != "none" && (chatReq.ReasoningEffort != "" || chatReq.ReasoningBudget != nil) {
-		req.Thinking = buildThinking(chatReq, config)
-	}
+	req.Thinking = thinkingPlan.thinking
+	req.OutputConfig = thinkingPlan.outputConfig
 
 	// Restore thinking display from TransformerMetadata
 	if req.Thinking != nil && chatReq.TransformerMetadata != nil {
@@ -161,26 +248,47 @@ func buildBaseRequest(chatReq *llm.Request, config *Config) *MessageRequest {
 		}
 	}
 
-	// Restore output_config from TransformerMetadata
-	if chatReq.TransformerMetadata != nil {
-		if effort, ok := chatReq.TransformerMetadata[TransformerMetadataKeyOutputConfigEffort].(string); ok && effort != "" {
-			if supportsOutputConfig(config) {
-				req.OutputConfig = &OutputConfig{Effort: effort}
-			} else if req.Thinking == nil || req.Thinking.Type == "adaptive" {
-				req.Thinking = &Thinking{
-					Type:         "enabled",
-					BudgetTokens: getThinkingBudgetTokensWithConfig(effort, config),
-				}
-			}
-		}
-	}
-
 	// Restore Anthropic's top-level cache_control (automatic prompt caching).
 	// When present we keep it as-is on the upstream request and skip our own
 	// per-block breakpoint optimization (handled in TransformRequest).
 	if chatReq.TransformerMetadata != nil {
-		if cc, ok := chatReq.TransformerMetadata[TransformerMetadataKeyCacheControl].(*CacheControl); ok && cc != nil {
-			req.CacheControl = cc
+		if raw := asJSONRawMessage(chatReq.TransformerMetadata[TransformerMetadataKeyCacheControl]); len(raw) > 0 {
+			var cc CacheControl
+			if err := json.Unmarshal(raw, &cc); err == nil && cc.Type != "" {
+				req.CacheControl = &cc
+			}
+		}
+	}
+
+	// Restore Anthropic's top-level context_management (context-compression
+	// strategy) carried through TransformerMetadata as opaque json.RawMessage.
+	if chatReq.TransformerMetadata != nil {
+		if cm := asJSONRawMessage(chatReq.TransformerMetadata[TransformerMetadataKeyContextManagement]); len(cm) > 0 {
+			req.ContextManagement = cm
+		}
+	}
+
+	// Restore Anthropic-native container / inference_geo as opaque JSON.
+	if chatReq.TransformerMetadata != nil {
+		if container := asJSONRawMessage(chatReq.TransformerMetadata[TransformerMetadataKeyContainer]); len(container) > 0 {
+			req.Container = container
+		}
+		if geo := asJSONRawMessage(chatReq.TransformerMetadata[TransformerMetadataKeyInferenceGeo]); len(geo) > 0 {
+			req.InferenceGeo = geo
+		}
+		if mcpServers := asJSONRawMessage(chatReq.TransformerMetadata[TransformerMetadataKeyMCPServers]); len(mcpServers) > 0 {
+			req.MCPServers = mcpServers
+		}
+
+	}
+
+	// Restore top_k carried through TransformerMetadata (canonical llm.Request
+	// has no TopK field). Mirrors the cache_control restoration above.
+	if chatReq.TransformerMetadata != nil {
+		if topK, ok := chatReq.TransformerMetadata[shared.TransformerMetadataKeyTopK].(*int64); ok && topK != nil {
+			req.TopK = topK
+		} else if topK, ok := chatReq.TransformerMetadata[transformerMetadataKeyTopKLegacy].(*int64); ok && topK != nil {
+			req.TopK = topK
 		}
 	}
 
@@ -200,19 +308,130 @@ func resolveMaxTokens(chatReq *llm.Request) int64 {
 	}
 }
 
-// buildThinking creates the Thinking configuration.
-func buildThinking(chatReq *llm.Request, config *Config) *Thinking {
-	budgetTokens := lo.FromPtrOr(chatReq.ReasoningBudget, getThinkingBudgetTokensWithConfig(chatReq.ReasoningEffort, config))
+// anthropicRawToolFragment preserves adapter-specific tools[] entries with their
+// original wire index so same-protocol replay can reinsert them among converted
+// function/web_search tools without reordering.
+type anthropicRawToolFragment struct {
+	OriginalIndex int
+	Raw           json.RawMessage
+}
 
-	return &Thinking{
-		Type:         "enabled",
-		BudgetTokens: budgetTokens,
+// appendAnthropicRawTools re-attaches Anthropic tool declaration fragments at
+// their original tools[] indexes. Exclusive raw variants (mcp_toolset /
+// non-web-search native tools) are inserted as raw-only tools; function/web_search
+// raw fragments replace the common typed reconstruction so Anthropic-only children
+// are preserved.
+func appendAnthropicRawTools(tools []Tool, chatReq *llm.Request) []Tool {
+	frags := anthropicRawToolFragments(chatReq)
+	if len(frags) == 0 {
+		return tools
+	}
+
+	rawByIndex := make(map[int]json.RawMessage, len(frags))
+	maxIndex := len(tools) + len(frags) - 1
+	for _, frag := range frags {
+		if len(frag.Raw) == 0 {
+			continue
+		}
+		rawByIndex[frag.OriginalIndex] = frag.Raw
+		if frag.OriginalIndex > maxIndex {
+			maxIndex = frag.OriginalIndex
+		}
+	}
+	if len(rawByIndex) == 0 {
+		return tools
+	}
+
+	out := make([]Tool, 0, maxIndex+1)
+	commonIdx := 0
+	for i := 0; i <= maxIndex; i++ {
+		if raw, ok := rawByIndex[i]; ok {
+			tool := Tool{Raw: append(json.RawMessage(nil), raw...)}
+			// Best-effort type probe for debug/clarity; MarshalJSON uses Raw.
+			var probe struct {
+				Type string `json:"type"`
+			}
+			_ = json.Unmarshal(raw, &probe)
+			if probe.Type != "" {
+				tool.Type = probe.Type
+			}
+			// If this raw fragment overlays a common tool (function/web_search),
+			// consume that common tool slot so order stays correct.
+			if !isExclusiveAnthropicRawTool(tool) && commonIdx < len(tools) {
+				commonIdx++
+			}
+			out = append(out, tool)
+			continue
+		}
+		if commonIdx < len(tools) {
+			out = append(out, tools[commonIdx])
+			commonIdx++
+		}
+	}
+	for commonIdx < len(tools) {
+		out = append(out, tools[commonIdx])
+		commonIdx++
+	}
+	return out
+}
+
+func anthropicRawToolFragments(chatReq *llm.Request) []anthropicRawToolFragment {
+	if chatReq == nil || chatReq.TransformerMetadata == nil {
+		return nil
+	}
+	raw, ok := chatReq.TransformerMetadata[TransformerMetadataKeyRawTools]
+	if !ok || raw == nil {
+		return nil
+	}
+
+	switch v := raw.(type) {
+	case []anthropicRawToolFragment:
+		return v
+	case []json.RawMessage:
+		// Backward-compatible: legacy unindexed fragments append after common tools.
+		out := make([]anthropicRawToolFragment, 0, len(v))
+		for i, frag := range v {
+			if len(frag) == 0 {
+				continue
+			}
+			out = append(out, anthropicRawToolFragment{OriginalIndex: i, Raw: frag})
+		}
+		return out
+	case []any:
+		out := make([]anthropicRawToolFragment, 0, len(v))
+		for i, item := range v {
+			switch frag := item.(type) {
+			case anthropicRawToolFragment:
+				out = append(out, frag)
+			case map[string]any:
+				idx := i
+				if n, ok := frag["OriginalIndex"].(int); ok {
+					idx = n
+				} else if n, ok := frag["OriginalIndex"].(float64); ok {
+					idx = int(n)
+				}
+				if rawFrag := asJSONRawMessage(frag["Raw"]); len(rawFrag) > 0 {
+					out = append(out, anthropicRawToolFragment{OriginalIndex: idx, Raw: rawFrag})
+				}
+			default:
+				if rawFrag := asJSONRawMessage(item); len(rawFrag) > 0 {
+					out = append(out, anthropicRawToolFragment{OriginalIndex: i, Raw: rawFrag})
+				}
+			}
+		}
+		return out
+	default:
+		if frag := asJSONRawMessage(raw); len(frag) > 0 {
+			return []anthropicRawToolFragment{{OriginalIndex: 0, Raw: frag}}
+		}
+		return nil
 	}
 }
 
 // convertToolsAnthropic converts LLM tools to Anthropic tools.
 // If the platform is not direct Anthropic API or Bedrock, anthropic native tools (like web_search) are filtered out.
-// Only web_search tool is supported as native tool, other native tools (image_generation, google_*, etc.) are ignored.
+// Only web_search tool is supported as native tool; other native tools (image_generation, google_*, etc.)
+// are omitted here and must be diagnosed by recordAnthropicUnsupportedNativeToolLossyDowngrades.
 func convertToolsAnthropic(tools []llm.Tool, config *Config) []Tool {
 	if len(tools) == 0 {
 		return nil
@@ -259,7 +478,8 @@ func convertToolsAnthropic(tools []llm.Tool, config *Config) []Tool {
 
 			anthropicTools = append(anthropicTools, anthropicTool)
 		default:
-			// Ignore other native tools (image_generation, google_*, etc.)
+			// Omit other native tools (image_generation, google_*, etc.).
+			// Loss is recorded by recordAnthropicUnsupportedNativeToolLossyDowngrades.
 			continue
 		}
 	}
@@ -316,7 +536,9 @@ func convertStopSequences(stop *llm.Stop) []string {
 }
 
 // convertMessages converts all messages to Anthropic format.
-func convertMessages(chatReq *llm.Request, config *Config) []MessageParam {
+// Tool results are only paired with the immediately adjacent contiguous tool-result
+// batch after an assistant tool_use turn. Non-local matching/hoisting is rejected.
+func convertMessages(chatReq *llm.Request, config *Config) ([]MessageParam, error) {
 	messages := make([]MessageParam, 0, len(chatReq.Messages))
 	// First, filter out system and developer messages as they are handled separately.
 	nonSystemMsgs := lo.Filter(chatReq.Messages, func(msg llm.Message, _ int) bool {
@@ -326,6 +548,21 @@ func convertMessages(chatReq *llm.Request, config *Config) []MessageParam {
 	// Track which message indexes have been processed (for user messages with MessageIndex and tool messages)
 	processedMessageIndexes := make(map[int]bool)
 	processedToolCallIDs := make(map[string]bool)
+	// OpenAI freeform custom call IDs are dropped (no Anthropic tool_use). Mark
+	// them processed so matching tool results are not re-emitted as orphans.
+	for _, msg := range nonSystemMsgs {
+		for _, tc := range msg.ToolCalls {
+			if !isOpenAICustomToolCall(tc) {
+				continue
+			}
+			if tc.ID != "" {
+				processedToolCallIDs[tc.ID] = true
+			}
+			if tc.ResponseCustomToolCall != nil && tc.ResponseCustomToolCall.CallID != "" {
+				processedToolCallIDs[tc.ResponseCustomToolCall.CallID] = true
+			}
+		}
+	}
 
 	for i := 0; i < len(nonSystemMsgs); i++ {
 		msg := nonSystemMsgs[i]
@@ -336,6 +573,11 @@ func convertMessages(chatReq *llm.Request, config *Config) []MessageParam {
 
 		switch msg.Role {
 		case "tool":
+			// Drop tool results that only belonged to unsupported OpenAI custom calls.
+			if msg.ToolCallID != nil && processedToolCallIDs[*msg.ToolCallID] {
+				processedMessageIndexes[i] = true
+				continue
+			}
 			// Handle standalone tool messages (not following an assistant with tool calls)
 			// Group consecutive tool messages into a single user message with tool_results
 			if toolMsg, newIndex, created := groupToolResultMessages(nonSystemMsgs, i, processedMessageIndexes, processedToolCallIDs); created {
@@ -358,65 +600,175 @@ func convertMessages(chatReq *llm.Request, config *Config) []MessageParam {
 				messages = append(messages, assistantMsg...)
 			}
 
-			// After an assistant message with tool calls, the next message might be tool results.
-			if len(msg.ToolCalls) > 0 {
-				// Try to find corresponding tool results, even if not immediately following.
-				if toolMsg, ok := findToolResultsForAssistant(nonSystemMsgs, msg.ToolCalls, processedToolCallIDs, processedMessageIndexes); ok {
+			// After an assistant message with convertible tool calls, only the
+			// immediately following contiguous tool-result batch may attach.
+			lifecycleCalls := anthropicLifecycleToolCalls(msg.ToolCalls)
+			if len(lifecycleCalls) > 0 {
+				toolMsg, ok, err := collectAdjacentToolResultsForAssistant(
+					nonSystemMsgs,
+					i,
+					lifecycleCalls,
+					processedToolCallIDs,
+					processedMessageIndexes,
+				)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
 					messages = append(messages, toolMsg)
-				} else if i+1 < len(nonSystemMsgs) {
-					// Fallback to grouping consecutive tool messages if no explicit match found (legacy behavior)
-					if toolMsg, newIndex, created := groupToolResultMessages(nonSystemMsgs, i+1, processedMessageIndexes, processedToolCallIDs); created {
-						messages = append(messages, toolMsg)
-						i = newIndex
-					}
 				}
 			}
 		}
 	}
 
-	return messages
+	return messages, nil
 }
 
-// findToolResultsForAssistant looks for tool results matching the given tool calls.
-func findToolResultsForAssistant(
+// anthropicLifecycleToolCalls returns tool calls that participate in Anthropic
+// client tool_use/tool_result pairing. OpenAI freeform custom calls are excluded
+// because they have no Anthropic JSON tool-use equivalent.
+func anthropicLifecycleToolCalls(toolCalls []llm.ToolCall) []llm.ToolCall {
+	if len(toolCalls) == 0 {
+		return nil
+	}
+	out := make([]llm.ToolCall, 0, len(toolCalls))
+	for _, tc := range toolCalls {
+		if isOpenAICustomToolCall(tc) {
+			continue
+		}
+		out = append(out, tc)
+	}
+	return out
+}
+
+func isOpenAICustomToolCall(tc llm.ToolCall) bool {
+	if tc.OpenAIChatCustomToolCall != nil || tc.ResponseCustomToolCall != nil {
+		return true
+	}
+	switch tc.Type {
+	case "custom", llm.ToolTypeResponsesCustomTool:
+		return true
+	default:
+		return false
+	}
+}
+
+func isOpenAICustomToolDecl(tool llm.Tool) bool {
+	if tool.OpenAIChatCustomTool != nil || tool.ResponseCustomTool != nil {
+		return true
+	}
+	switch tool.Type {
+	case "custom", llm.ToolTypeResponsesCustomTool:
+		return true
+	default:
+		return false
+	}
+}
+
+// collectAdjacentToolResultsForAssistant consumes only the contiguous tool-result
+// batch immediately after assistantIdx. It rejects incomplete coverage and
+// non-adjacent late results. It never synthesizes missing results.
+func collectAdjacentToolResultsForAssistant(
 	messages []llm.Message,
+	assistantIdx int,
 	toolCalls []llm.ToolCall,
 	processedToolCallIDs map[string]bool,
 	processedMessageIndexes map[int]bool,
-) (MessageParam, bool) {
+) (MessageParam, bool, error) {
+	expected := make([]string, 0, len(toolCalls))
+	expectedSet := make(map[string]struct{}, len(toolCalls))
+	for _, tc := range toolCalls {
+		if tc.ID == "" || processedToolCallIDs[tc.ID] {
+			continue
+		}
+		if _, dup := expectedSet[tc.ID]; dup {
+			return MessageParam{}, false, fmt.Errorf("%w: duplicate tool_use id %q", transformer.ErrInvalidRequest, tc.ID)
+		}
+		expectedSet[tc.ID] = struct{}{}
+		expected = append(expected, tc.ID)
+	}
+	if len(expected) == 0 {
+		return MessageParam{}, false, nil
+	}
+
+	// Gather contiguous tool messages immediately after the assistant turn.
 	var (
 		toolResultBlocks []MessageContentBlock
 		toolMsgIndexes   = make(map[int]struct{})
+		seenResultIDs    = make(map[string]struct{})
+		start            = assistantIdx + 1
+		idx              = start
 	)
 
-	for _, tc := range toolCalls {
-		if processedToolCallIDs[tc.ID] {
-			continue
+	for idx < len(messages) && messages[idx].Role == "tool" {
+		toolMsg := messages[idx]
+		if toolMsg.ToolCallID == nil || *toolMsg.ToolCallID == "" {
+			return MessageParam{}, false, fmt.Errorf("%w: tool result missing tool_call_id", transformer.ErrInvalidRequest)
 		}
-
-		// Look for this tool call ID in all messages
-		for i, msg := range messages {
-			if msg.Role == "tool" && msg.ToolCallID != nil && *msg.ToolCallID == tc.ID {
-				toolResultBlocks = append(toolResultBlocks, convertToToolResultBlock(msg))
-				processedToolCallIDs[tc.ID] = true
-				processedMessageIndexes[i] = true
-
-				if msg.MessageIndex != nil {
-					toolMsgIndexes[*msg.MessageIndex] = struct{}{}
-				}
-
-				break
+		id := *toolMsg.ToolCallID
+		if _, ok := expectedSet[id]; !ok {
+			// Contiguous tool batch includes an unknown id for this assistant turn.
+			// Skip only if this id was already consumed by a prior turn; otherwise reject.
+			if processedToolCallIDs[id] {
+				idx++
+				continue
 			}
+			return MessageParam{}, false, fmt.Errorf("%w: tool_result %q does not match adjacent tool_use batch", transformer.ErrInvalidRequest, id)
 		}
+		if _, dup := seenResultIDs[id]; dup || processedToolCallIDs[id] {
+			return MessageParam{}, false, fmt.Errorf("%w: duplicate tool_result for %q", transformer.ErrInvalidRequest, id)
+		}
+		seenResultIDs[id] = struct{}{}
+		toolResultBlocks = append(toolResultBlocks, convertToToolResultBlock(toolMsg))
+		processedToolCallIDs[id] = true
+		processedMessageIndexes[idx] = true
+		if toolMsg.MessageIndex != nil {
+			toolMsgIndexes[*toolMsg.MessageIndex] = struct{}{}
+		}
+		idx++
 	}
 
-	// Look for related user message with the same MessageIndex
+	if len(toolResultBlocks) == 0 {
+		// No adjacent results. If a matching result exists later across another
+		// turn, reject rather than hoist (Anthropic requires immediate follow-up).
+		if lateID, found := findNonAdjacentToolResultID(messages, idx, expectedSet, processedToolCallIDs); found {
+			return MessageParam{}, false, fmt.Errorf(
+				"%w: tool_result for %q is not immediately adjacent to its tool_use turn",
+				transformer.ErrInvalidRequest,
+				lateID,
+			)
+		}
+		// Anthropic requires every tool_use to be followed by a user tool_result
+		// message. Emitting bare tool_use without results is invalid.
+		return MessageParam{}, false, fmt.Errorf(
+			"%w: incomplete adjacent tool_result batch; missing results for %v",
+			transformer.ErrInvalidRequest,
+			expected,
+		)
+	}
+
+	// Partial adjacent coverage is invalid for Anthropic parallel tool use.
+	if len(seenResultIDs) != len(expectedSet) {
+		missing := make([]string, 0)
+		for _, id := range expected {
+			if _, ok := seenResultIDs[id]; !ok {
+				missing = append(missing, id)
+			}
+		}
+		return MessageParam{}, false, fmt.Errorf(
+			"%w: incomplete adjacent tool_result batch; missing results for %v",
+			transformer.ErrInvalidRequest,
+			missing,
+		)
+	}
+
+	// Look for related user message with the same MessageIndex (Anthropic same-
+	// user-message tool_result + text). Only merge still-unprocessed user rows.
 	if len(toolMsgIndexes) > 0 {
 		for j := range messages {
 			if processedMessageIndexes[j] {
 				continue
 			}
-
 			userMsg := messages[j]
 			if userMsg.Role == "user" && userMsg.MessageIndex != nil {
 				if _, ok := toolMsgIndexes[*userMsg.MessageIndex]; ok {
@@ -428,16 +780,34 @@ func findToolResultsForAssistant(
 		}
 	}
 
-	if len(toolResultBlocks) > 0 {
-		return MessageParam{
-			Role: "user",
-			Content: MessageContent{
-				MultipleContent: toolResultBlocks,
-			},
-		}, true
-	}
+	return MessageParam{
+		Role: "user",
+		Content: MessageContent{
+			MultipleContent: toolResultBlocks,
+		},
+	}, true, nil
+}
 
-	return MessageParam{}, false
+func findNonAdjacentToolResultID(
+	messages []llm.Message,
+	start int,
+	expectedSet map[string]struct{},
+	processedToolCallIDs map[string]bool,
+) (string, bool) {
+	for i := start; i < len(messages); i++ {
+		msg := messages[i]
+		if msg.Role != "tool" || msg.ToolCallID == nil {
+			continue
+		}
+		id := *msg.ToolCallID
+		if processedToolCallIDs[id] {
+			continue
+		}
+		if _, ok := expectedSet[id]; ok {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // groupToolResultMessages groups consecutive tool messages and finds related user message content.
@@ -512,12 +882,32 @@ func extractUserContentBlocks(msg llm.Message) []MessageContentBlock {
 		})
 	} else if len(msg.Content.MultipleContent) > 0 {
 		for _, part := range msg.Content.MultipleContent {
-			if part.Type == "text" && part.Text != nil {
-				blocks = append(blocks, MessageContentBlock{
-					Type:         "text",
-					Text:         part.Text,
-					CacheControl: convertToAnthropicCacheControl(part.CacheControl),
-				})
+			switch part.Type {
+			case "text":
+				if part.Text != nil {
+					blocks = append(blocks, MessageContentBlock{
+						Type:         "text",
+						Text:         part.Text,
+						CacheControl: convertToAnthropicCacheControl(part.CacheControl),
+					})
+				}
+			case "image_url":
+				if block, ok := convertImageURLToAnthropicBlock(part); ok {
+					blocks = append(blocks, block)
+				}
+			case "document":
+				if block, ok := convertDocumentURLToAnthropicBlock(part); ok {
+					blocks = append(blocks, block)
+				}
+			case "anthropic_raw_block":
+				// Preserve top-level future/unknown blocks that ride next to
+				// tool_result through groupToolResultMessages / collectAdjacentToolResultsForAssistant.
+				if raw := getAnthropicRawBlock(part.TransformerMetadata); len(raw) > 0 {
+					blocks = append(blocks, MessageContentBlock{
+						Type: "anthropic_raw_block",
+						Raw:  append(json.RawMessage(nil), raw...),
+					})
+				}
 			}
 		}
 	}
@@ -563,8 +953,14 @@ func convertAssistantWithToolCalls(msg llm.Message, config *Config) ([]MessagePa
 func buildPreBlocks(msg llm.Message, config *Config) []MessageContentBlock {
 	var blocks []MessageContentBlock
 
+	// Prefer ReasoningContent, fallback to Reasoning if ReasoningContent is nil
+	reasoningContent := msg.ReasoningContent
+	if reasoningContent == nil && msg.Reasoning != nil {
+		reasoningContent = msg.Reasoning
+	}
+
 	reasoningContent, reasoningSignature := prepareAnthropicReasoning(
-		msg.ReasoningContent,
+		reasoningContent,
 		msg.ReasoningSignature,
 		config,
 	)
@@ -611,8 +1007,14 @@ func buildMessageContent(msg llm.Message, config *Config) (MessageContent, bool)
 	var blocks []MessageContentBlock
 
 	if hasThinkingContent(msg) {
+		// Prefer ReasoningContent, fallback to Reasoning if ReasoningContent is nil
+		reasoningContent := msg.ReasoningContent
+		if reasoningContent == nil && msg.Reasoning != nil {
+			reasoningContent = msg.Reasoning
+		}
+
 		reasoningContent, reasoningSignature := prepareAnthropicReasoning(
-			msg.ReasoningContent,
+			reasoningContent,
 			msg.ReasoningSignature,
 			config,
 		)
@@ -642,15 +1044,22 @@ func buildMessageContent(msg llm.Message, config *Config) (MessageContent, bool)
 // hasThinkingContent checks if message has reasoning content.
 func hasThinkingContent(msg llm.Message) bool {
 	return (msg.ReasoningContent != nil && *msg.ReasoningContent != "") ||
-		(msg.RedactedReasoningContent != nil && *msg.RedactedReasoningContent != "")
+		(msg.RedactedReasoningContent != nil && *msg.RedactedReasoningContent != "") ||
+		(msg.Reasoning != nil && *msg.Reasoning != "")
 }
 
 // buildMultipleContentWithThinking creates content blocks including thinking.
 func buildMultipleContentWithThinking(msg llm.Message, config *Config) MessageContent {
 	blocks := make([]MessageContentBlock, 0, 3)
 
+	// Prefer ReasoningContent, fallback to Reasoning if ReasoningContent is nil
+	reasoningContent := msg.ReasoningContent
+	if reasoningContent == nil && msg.Reasoning != nil {
+		reasoningContent = msg.Reasoning
+	}
+
 	reasoningContent, reasoningSignature := prepareAnthropicReasoning(
-		msg.ReasoningContent,
+		reasoningContent,
 		msg.ReasoningSignature,
 		config,
 	)
@@ -679,9 +1088,11 @@ func buildThinkingBlock(reasoningContent, reasoningSignature *string) *MessageCo
 	}
 
 	block := &MessageContentBlock{
-		Type:      "thinking",
-		Thinking:  reasoningContent,
-		Signature: reasoningSignature,
+		Type:     "thinking",
+		Thinking: reasoningContent,
+	}
+	if reasoningSignature != nil && *reasoningSignature != "" {
+		block.Signature = reasoningSignature
 	}
 
 	return block
@@ -700,13 +1111,19 @@ func buildRedactedThinkingBlock(redactedContent *string) *MessageContentBlock {
 }
 
 func convertToToolResultBlock(msg llm.Message) MessageContentBlock {
-	return MessageContentBlock{
+	block := MessageContentBlock{
 		Type:         "tool_result",
 		ToolUseID:    msg.ToolCallID,
-		Content:      convertToAnthropicTrivialContent(msg.Content),
 		CacheControl: convertToAnthropicCacheControl(msg.CacheControl),
 		IsError:      msg.ToolCallIsError,
 	}
+
+	// Rebuild from typed parts, including anthropic_raw_block children that
+	// preserve unknown nested tool_result content.
+	if content := convertToAnthropicTrivialContent(msg.Content); content != nil {
+		block.Content = content
+	}
+	return block
 }
 
 // convertImageURLToAnthropicBlock converts image_url content part to Anthropic MessageContentBlock.
@@ -739,6 +1156,36 @@ func convertImageURLToAnthropicBlock(part llm.MessageContentPart) (MessageConten
 	}, true
 }
 
+// convertDocumentURLToAnthropicBlock converts a canonical document content part
+// to an Anthropic document content block (used for PDFs etc.).
+func convertDocumentURLToAnthropicBlock(part llm.MessageContentPart) (MessageContentBlock, bool) {
+	if part.Document == nil || part.Document.URL == "" {
+		return MessageContentBlock{}, false
+	}
+
+	url := part.Document.URL
+	if parsed := xurl.ParseDataURL(url); parsed != nil {
+		return MessageContentBlock{
+			Type: "document",
+			Source: &ImageSource{
+				Type:      "base64",
+				MediaType: parsed.MediaType,
+				Data:      parsed.Data,
+			},
+			CacheControl: convertToAnthropicCacheControl(part.CacheControl),
+		}, true
+	}
+
+	return MessageContentBlock{
+		Type: "document",
+		Source: &ImageSource{
+			Type: "url",
+			URL:  part.Document.URL,
+		},
+		CacheControl: convertToAnthropicCacheControl(part.CacheControl),
+	}, true
+}
+
 // convertToAnthropicTrivialContent converts llm.MessageContent to Anthropic MessageContent format.
 func convertToAnthropicTrivialContent(content llm.MessageContent) *MessageContent {
 	if content.Content != nil {
@@ -761,6 +1208,17 @@ func convertToAnthropicTrivialContent(content llm.MessageContent) *MessageConten
 			case "image_url":
 				if block, ok := convertImageURLToAnthropicBlock(part); ok {
 					blocks = append(blocks, block)
+				}
+			case "document":
+				if block, ok := convertDocumentURLToAnthropicBlock(part); ok {
+					blocks = append(blocks, block)
+				}
+			case "anthropic_raw_block":
+				if raw := getAnthropicRawBlock(part.TransformerMetadata); len(raw) > 0 {
+					blocks = append(blocks, MessageContentBlock{
+						Type: "anthropic_raw_block",
+						Raw:  append(json.RawMessage(nil), raw...),
+					})
 				}
 			}
 		}
@@ -874,6 +1332,13 @@ func convertMultiplePartContent(msg llm.Message) (MessageContent, bool) {
 					CacheControl: convertToAnthropicCacheControl(part.CacheControl),
 				})
 			}
+		case "anthropic_raw_block":
+			if raw := getAnthropicRawBlock(part.TransformerMetadata); len(raw) > 0 {
+				appendOrdered(part.TransformerMetadata, MessageContentBlock{
+					Type: "anthropic_raw_block",
+					Raw:  append(json.RawMessage(nil), raw...),
+				})
+			}
 		case "image_url":
 			if part.ImageURL != nil && part.ImageURL.URL != "" {
 				url := part.ImageURL.URL
@@ -898,10 +1363,39 @@ func convertMultiplePartContent(msg llm.Message) (MessageContent, bool) {
 					})
 				}
 			}
+		case "document":
+			if part.Document != nil && part.Document.URL != "" {
+				url := part.Document.URL
+				if parsed := xurl.ParseDataURL(url); parsed != nil {
+					appendOrdered(part.TransformerMetadata, MessageContentBlock{
+						Type: "document",
+						Source: &ImageSource{
+							Type:      "base64",
+							MediaType: parsed.MediaType,
+							Data:      parsed.Data,
+						},
+						CacheControl: convertToAnthropicCacheControl(part.CacheControl),
+					})
+				} else {
+					appendOrdered(part.TransformerMetadata, MessageContentBlock{
+						Type: "document",
+						Source: &ImageSource{
+							Type: "url",
+							URL:  part.Document.URL,
+						},
+						CacheControl: convertToAnthropicCacheControl(part.CacheControl),
+					})
+				}
+			}
 		}
 	}
 
 	for _, toolCall := range msg.ToolCalls {
+		if isOpenAICustomToolCall(toolCall) {
+			// Freeform OpenAI custom tools have no Anthropic JSON tool_use mapping.
+			// Skipping prevents empty name/input tool_use blocks; callers record LossyDowngrade.
+			continue
+		}
 		appendOrdered(toolCall.TransformerMetadata, toolUseBlockFromLLM(toolCall))
 	}
 
@@ -943,12 +1437,24 @@ func llmAnnotationFromCitation(citation TextCitation) (llm.Annotation, bool) {
 	return annotation, true
 }
 
-func cloneAnthropicResponseContentBlocks(blocks []MessageContentBlock) []MessageContentBlock {
+// marshalAnthropicResponseContentRaw deep-copies each Anthropic response content
+// block as json.RawMessage for ProviderExtensions.Anthropic.Response.RawContent.
+// Prefer original Raw bytes for unknown/future blocks so nested native fields
+// survive same-protocol replay without re-encoding loss.
+func marshalAnthropicResponseContentRaw(blocks []MessageContentBlock) []json.RawMessage {
 	if len(blocks) == 0 {
 		return nil
 	}
 
-	return xjson.MustTo[[]MessageContentBlock](xjson.MustMarshal(blocks))
+	out := make([]json.RawMessage, len(blocks))
+	for i, block := range blocks {
+		if len(block.Raw) > 0 {
+			out[i] = append(json.RawMessage(nil), block.Raw...)
+			continue
+		}
+		out[i] = append(json.RawMessage(nil), xjson.MustMarshal(block)...)
+	}
+	return out
 }
 
 // convertToLlmResponse converts Anthropic Message to unified Response format.
@@ -962,7 +1468,7 @@ func convertToLlmResponse(anthropicResp *Message, platformType PlatformType) *ll
 		}
 	}
 
-	var transformerMetadata map[string]any
+	var needRawContent bool
 	resp := &llm.Response{
 		ID:          anthropicResp.ID,
 		Object:      "chat.completion",
@@ -1003,15 +1509,15 @@ func convertToLlmResponse(anthropicResp *Message, platformType PlatformType) *ll
 				annotations = append(annotations, lo.FilterMap(block.Citations, func(citation TextCitation, _ int) (llm.Annotation, bool) {
 					return llmAnnotationFromCitation(citation)
 				})...)
+				// The common annotation model does not carry every Anthropic citation
+				// child (encrypted_index, cited_text, and future variants). Keep the
+				// original ordered response content on the existing native sidecar.
+				needRawContent = true
 			}
 		case "image":
-			if block.Source != nil {
-				content.MultipleContent = append(content.MultipleContent, llm.MessageContentPart{
-					Type: "image",
-					ImageURL: &llm.ImageURL{
-						URL: block.Source.Data,
-					},
-				})
+			if part, ok := convertImageSourceToLLMImageURLPart(block.Source, block.CacheControl); ok {
+				setAnthropicBlockIndex(&part.TransformerMetadata, i)
+				content.MultipleContent = append(content.MultipleContent, part)
 			}
 		case "tool_use":
 			if block.ID != "" && block.Name != nil {
@@ -1038,19 +1544,18 @@ func convertToLlmResponse(anthropicResp *Message, platformType PlatformType) *ll
 					toolCalls = append(toolCalls, tc)
 				}
 
-				if transformerMetadata == nil {
-					transformerMetadata = map[string]any{}
-				}
-				transformerMetadata[TransformerMetadataKeyAnthropicResponseContent] = cloneAnthropicResponseContentBlocks(anthropicResp.Content)
+				needRawContent = true
 			case isAnthropicSpecialToolResultBlock(block.Type):
 				ir := inlineToolResultFromBlock(&block)
 				setAnthropicBlockIndex(&ir.TransformerMetadata, i)
 				inlineToolResults = append(inlineToolResults, ir)
 
-				if transformerMetadata == nil {
-					transformerMetadata = map[string]any{}
-				}
-				transformerMetadata[TransformerMetadataKeyAnthropicResponseContent] = cloneAnthropicResponseContentBlocks(anthropicResp.Content)
+				needRawContent = true
+			default:
+				// Unknown/future response blocks have no common representation.
+				// Retain the original ordered content on the existing Anthropic-only
+				// response sidecar for same-protocol replay.
+				needRawContent = true
 			}
 		}
 	}
@@ -1112,17 +1617,55 @@ func convertToLlmResponse(anthropicResp *Message, platformType PlatformType) *ll
 		InlineToolResults:        inlineToolResults,
 	}
 
+	finishReason := convertToLlmFinishReason(anthropicResp.StopReason)
+
 	choice := llm.Choice{
 		Index:        0,
 		Message:      message,
-		FinishReason: convertToLlmFinishReason(anthropicResp.StopReason),
+		FinishReason: finishReason,
+	}
+
+	// Carry the original Anthropic stop_reason because several native values
+	// collapse in the common finish_reason model (for example stop_sequence and
+	// pause_turn both become stop, while refusal becomes content_filter).
+	// Anthropic outbound replay consumes this adapter-local metadata; other
+	// protocol adapters continue to use the common finish reason.
+	if anthropicResp.StopReason != nil {
+		switch *anthropicResp.StopReason {
+		case "stop_sequence", "pause_turn", "refusal":
+			choice.TransformerMetadata = map[string]any{
+				TransformerMetadataKeyAnthropicStopReason: *anthropicResp.StopReason,
+			}
+		}
 	}
 
 	resp.Choices = []llm.Choice{choice}
 
 	resp.Usage = convertToLlmUsage(anthropicResp.Usage, platformType)
-	if transformerMetadata != nil {
-		resp.TransformerMetadata = transformerMetadata
+
+	// Backfill service_tier from usage so it survives non-streaming conversion,
+	// mirroring the streaming path.
+	if anthropicResp.Usage != nil {
+		resp.ServiceTier = anthropicResp.Usage.ServiceTier
+	}
+	// Preserve Anthropic-only non-stream response fields on their named owner.
+	if anthropicResp.StopSequence != nil || len(anthropicResp.StopDetails) > 0 ||
+		(anthropicResp.Usage != nil && len(anthropicResp.Usage.Raw) > 0) ||
+		needRawContent {
+		ext := llm.EnsureAnthropicResponseExtensions(resp)
+		if anthropicResp.StopSequence != nil {
+			ext.StopSequence = lo.ToPtr(*anthropicResp.StopSequence)
+		}
+		ext.StopDetails = append(json.RawMessage(nil), anthropicResp.StopDetails...)
+		if anthropicResp.Usage != nil {
+			ext.RawUsage = append(json.RawMessage(nil), anthropicResp.Usage.Raw...)
+		}
+		if needRawContent {
+			// Full ordered Anthropic content[] for same-protocol replay when common
+			// llm.Response cannot own every block (unknown future blocks, citation
+			// native details, special tool blocks). Only Anthropic inbound reads it.
+			ext.RawContent = marshalAnthropicResponseContentRaw(anthropicResp.Content)
+		}
 	}
 
 	return resp
@@ -1132,6 +1675,7 @@ func convertToLlmResponse(anthropicResp *Message, platformType PlatformType) *ll
 // tool_use-like block (tool_use or any special *_tool_use). For special
 // blocks, TransformerMetadata is populated with anthropic_type (+ optional
 // anthropic_caller) so the block can be round-tripped.
+
 func toolCallFromAnthropicBlock(block MessageContentBlock) llm.ToolCall {
 	repaired := xjson.SafeJSONRawMessage(string(block.Input))
 
@@ -1162,7 +1706,7 @@ func toolUseBlockFromLLM(toolCall llm.ToolCall) MessageContentBlock {
 	return MessageContentBlock{
 		Type:         blockType,
 		ID:           toolCall.ID,
-		Name:         &toolCall.Function.Name,
+		Name:         lo.ToPtr(toolCall.Function.CompositeName()),
 		Input:        xjson.SafeJSONRawMessage(toolCall.Function.Arguments),
 		CacheControl: convertToAnthropicCacheControl(toolCall.CacheControl),
 		Caller:       getAnthropicCaller(toolCall.TransformerMetadata),

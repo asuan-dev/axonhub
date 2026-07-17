@@ -369,11 +369,17 @@ func (svc *ChannelService) buildNonDefaultEndpointOutbound(
 			})
 		}
 
+		var reasoningEffortMapping []llm.ReasoningEffortMapping
+		if c.Settings != nil {
+			reasoningEffortMapping = c.Settings.TransformOptions.ReasoningEffortMapping
+		}
+
 		return openai.NewOutboundTransformerWithConfig(&openai.Config{
-			PlatformType:   openai.PlatformOpenAI,
-			BaseURL:        baseURL,
-			APIKeyProvider: apiKeyProvider(),
-			EndpointPath:   ep.Path,
+			PlatformType:           openai.PlatformOpenAI,
+			BaseURL:                baseURL,
+			APIKeyProvider:         apiKeyProvider(),
+			EndpointPath:           ep.Path,
+			ReasoningEffortMapping: reasoningEffortMapping,
 		})
 	case llm.APIFormatOpenAICompletion.String():
 		return openai.NewCompletionOutboundTransformer(&openai.Config{

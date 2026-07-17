@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/samber/lo"
@@ -46,6 +47,48 @@ func TestRequestFromLLM(t *testing.T) {
 			},
 		},
 		{
+			name: "request with reasoning effort and budget",
+			llmReq: &llm.Request{
+				Model:           "o3",
+				ReasoningEffort: "high",
+				ReasoningBudget: lo.ToPtr(int64(5000)),
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hi"),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, req *Request) {
+				require.NotNil(t, req)
+				require.Equal(t, "high", req.ReasoningEffort)
+				require.NotNil(t, req.ReasoningBudget)
+				require.Equal(t, int64(5000), *req.ReasoningBudget)
+			},
+		},
+		{
+			name: "request with reasoning summary",
+			llmReq: &llm.Request{
+				Model:            "o3",
+				ReasoningSummary: lo.ToPtr("detailed"),
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hi"),
+						},
+					},
+				},
+			},
+			validate: func(t *testing.T, req *Request) {
+				require.NotNil(t, req)
+				require.NotNil(t, req.ReasoningSummary)
+				require.Equal(t, "detailed", *req.ReasoningSummary)
+			},
+		},
+		{
 			name: "request with helper fields stripped",
 			llmReq: &llm.Request{
 				Model: "gpt-4",
@@ -75,7 +118,7 @@ func TestRequestFromLLM(t *testing.T) {
 	}
 }
 
-func TestRequestFromLLM_FiltersResponsesCustomTools(t *testing.T) {
+func TestRequestFromLLM_BridgesResponsesCustomTools(t *testing.T) {
 	req := RequestFromLLM(&llm.Request{
 		Model:    "gpt-4o",
 		Messages: []llm.Message{{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("hi")}}},
@@ -97,8 +140,11 @@ func TestRequestFromLLM_FiltersResponsesCustomTools(t *testing.T) {
 	}, ReasoningFieldNone)
 
 	require.NotNil(t, req)
-	require.Len(t, req.Tools, 1)
-	require.Equal(t, llm.ToolTypeFunction, req.Tools[0].Type)
+	require.Len(t, req.Tools, 2)
+	require.Equal(t, "custom", req.Tools[0].Type)
+	require.NotNil(t, req.Tools[0].Custom)
+	require.Equal(t, "apply_patch", req.Tools[0].Custom.Name)
+	require.Equal(t, llm.ToolTypeFunction, req.Tools[1].Type)
 }
 
 func TestMessageContentPartAudioRoundTrip(t *testing.T) {
@@ -587,6 +633,50 @@ func TestMessageFromLLM_GeminiReasoningSignatureDoesNotInjectThoughtSignature(t 
 
 	require.Len(t, msg.ToolCalls, 1)
 	require.Nil(t, msg.ToolCalls[0].ExtraContent)
+}
+
+// TestMessage_ReasoningDetailsAndImagesRoundTrip covers #20: Chat response
+// must carry reasoning_details and images through canonical Message on both
+// inbound (Message -> llm.Message) and outbound (llm.Message -> Message).
+func TestMessage_ReasoningDetailsAndImagesRoundTrip(t *testing.T) {
+	details := []json.RawMessage{json.RawMessage(`{"type":"reasoning.summary","summary":"step 1"}`)}
+	images := []llm.ChatImage{{ImageURL: llm.ChatImageURL{URL: "data:image/png;base64,abc"}}}
+
+	t.Run("inbound preserves reasoning_details and images", func(t *testing.T) {
+		m := Message{
+			Role:             "assistant",
+			ReasoningDetails: details,
+			Images:           images,
+		}
+		llmMsg := m.ToLLMMessage()
+		require.Len(t, llmMsg.ReasoningDetails, 1)
+		require.JSONEq(t, `{"type":"reasoning.summary","summary":"step 1"}`, string(llmMsg.ReasoningDetails[0]))
+		require.Len(t, llmMsg.Images, 1)
+		require.Equal(t, "data:image/png;base64,abc", llmMsg.Images[0].ImageURL.URL)
+	})
+
+	t.Run("outbound preserves reasoning_details and images", func(t *testing.T) {
+		llmMsg := llm.Message{
+			Role:             "assistant",
+			ReasoningDetails: details,
+			Images:           images,
+		}
+		m := MessageFromLLM(llmMsg)
+		require.Len(t, m.ReasoningDetails, 1)
+		require.JSONEq(t, `{"type":"reasoning.summary","summary":"step 1"}`, string(m.ReasoningDetails[0]))
+		require.Len(t, m.Images, 1)
+		require.Equal(t, "data:image/png;base64,abc", m.Images[0].ImageURL.URL)
+	})
+}
+
+// D25/C13: chat outbound must preserve float logit_bias through canonical round-trip.
+func TestRequestFromLLM_LogitBiasPreservesFloat(t *testing.T) {
+	req := RequestFromLLM(&llm.Request{
+		Model:     "gpt-4",
+		LogitBias: map[string]float64{"5043": -100.5},
+	}, ReasoningFieldNone)
+	require.NotNil(t, req.LogitBias, "outbound Request.LogitBias must be populated")
+	require.InDelta(t, -100.5, req.LogitBias["5043"], 0.0001, "chat outbound must preserve float logit_bias")
 }
 
 func TestApplyReasoningEffortMapping(t *testing.T) {

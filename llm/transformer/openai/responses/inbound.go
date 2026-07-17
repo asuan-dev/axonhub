@@ -17,6 +17,7 @@ import (
 	"github.com/looplj/axonhub/llm/internal/pkg/xmap"
 	"github.com/looplj/axonhub/llm/internal/pkg/xurl"
 	"github.com/looplj/axonhub/llm/transformer"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 var _ transformer.Inbound = (*InboundTransformer)(nil)
@@ -76,6 +77,10 @@ func (t *InboundTransformer) TransformResponse(ctx context.Context, chatResp *ll
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal responses api response: %w", err)
 	}
+	body, err = restoreOpenAIResponsesResponseTopLevelFields(body, chatResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to restore responses api response fields: %w", err)
+	}
 
 	return &httpclient.Response{
 		StatusCode: http.StatusOK,
@@ -85,6 +90,38 @@ func (t *InboundTransformer) TransformResponse(ctx context.Context, chatResp *ll
 			"Cache-Control": []string{"no-cache"},
 		},
 	}, nil
+}
+
+func restoreOpenAIResponsesResponseTopLevelFields(body []byte, chatResp *llm.Response) ([]byte, error) {
+	if chatResp.ProviderExtensions == nil || chatResp.ProviderExtensions.OpenAIResponses == nil ||
+		chatResp.ProviderExtensions.OpenAIResponses.Response == nil {
+		return body, nil
+	}
+	rawFields := chatResp.ProviderExtensions.OpenAIResponses.Response.RawTopLevelFields
+	if len(rawFields) == 0 {
+		return body, nil
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
+	changed := false
+	for _, field := range openAIResponsesRawResponseTopLevelFields {
+		if _, typed := envelope[field]; typed {
+			continue
+		}
+		raw := rawFields[field]
+		if len(raw) == 0 || !json.Valid(raw) {
+			continue
+		}
+		envelope[field] = append(json.RawMessage(nil), raw...)
+		changed = true
+	}
+	if !changed {
+		return body, nil
+	}
+	return json.Marshal(envelope)
 }
 
 type ResponseError struct {
@@ -170,6 +207,8 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 	chatReq := &llm.Request{
 		Model:               req.Model,
 		Temperature:         req.Temperature,
+		FrequencyPenalty:    req.FrequencyPenalty,
+		PresencePenalty:     req.PresencePenalty,
 		Stream:              req.Stream,
 		Metadata:            maps.Clone(req.Metadata),
 		RequestType:         llm.RequestTypeChat,
@@ -188,21 +227,12 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		TransformOptions:    llm.TransformOptions{},
 	}
 
-	// Store help fields in TransformerMetadata
-	if len(req.Include) > 0 {
-		chatReq.TransformerMetadata["include"] = req.Include
-	}
-
-	if req.MaxToolCalls != nil {
-		chatReq.TransformerMetadata["max_tool_calls"] = req.MaxToolCalls
-	}
-
-	if req.PromptCacheRetention != nil {
-		chatReq.TransformerMetadata["prompt_cache_retention"] = req.PromptCacheRetention
-	}
-
-	if req.Truncation != nil {
-		chatReq.TransformerMetadata["truncation"] = req.Truncation
+	// Preserve top_k through TransformerMetadata; canonical llm.Request has no
+	// TopK field, so without this the sampling parameter is dropped on cross-format
+	// conversion (mirrors Anthropic top_k handling, shared neutral key).
+	if req.TopK != nil {
+		topK := *req.TopK
+		chatReq.TransformerMetadata[shared.TransformerMetadataKeyTopK] = &topK
 	}
 
 	// Convert reasoning
@@ -215,11 +245,42 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 			chatReq.ReasoningBudget = req.Reasoning.MaxTokens
 		}
 
-		// Priority: summary > generate_summary
+		// Keep summary and deprecated generate_summary as distinct identities.
+		// summary maps to common ReasoningSummary; generate_summary is also
+		// projected there only when summary is absent, but always retains a
+		// separate origin/value sidecar for same-protocol wire fidelity.
 		if req.Reasoning.Summary != "" {
 			chatReq.ReasoningSummary = lo.ToPtr(req.Reasoning.Summary)
 		} else if req.Reasoning.GenerateSummary != "" {
 			chatReq.ReasoningSummary = lo.ToPtr(req.Reasoning.GenerateSummary)
+			chatReq.TransformerMetadata[responsesReasoningGenerateSummaryOriginTransformerMetadataKey] = true
+		}
+		if req.Reasoning.GenerateSummary != "" {
+			chatReq.TransformerMetadata[responsesReasoningGenerateSummaryValueTransformerMetadataKey] = req.Reasoning.GenerateSummary
+		}
+
+		// Preserve reasoning.enabled through TransformerMetadata; canonical
+		// llm.Request has no Enabled slot, so without this the toggle is dropped
+		// on cross-format conversion (mirrors top_k/output_config handling).
+		if req.Reasoning.Enabled != nil {
+			chatReq.TransformerMetadata[responsesReasoningEnabledTransformerMetadataKey] = req.Reasoning.Enabled
+		}
+
+		// Preserve reasoning.context as Responses-native configuration. It is not
+		// a common effort/summary field and must not be stored as a protocol body
+		// field on llm.Request itself.
+		if req.Reasoning.Context != "" {
+			chatReq.TransformerMetadata[responsesReasoningContextTransformerMetadataKey] = req.Reasoning.Context
+		}
+	}
+
+	// Preserve top-level cache_control (OpenRouter/Anthropic prompt-caching
+	// marker) through TransformerMetadata as opaque json.RawMessage; canonical
+	// llm.Request has no CacheControl field, so without this it is dropped on
+	// cross-format conversion (mirrors top_k handling).
+	if req.CacheControl != nil {
+		if b, err := json.Marshal(req.CacheControl); err == nil {
+			chatReq.TransformerMetadata[shared.TransformerMetadataKeyCacheControl] = json.RawMessage(b)
 		}
 	}
 
@@ -231,9 +292,6 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 	// Convert stream options
 	if req.StreamOptions != nil {
 		chatReq.StreamOptions = &llm.StreamOptions{}
-		if req.StreamOptions.IncludeObfuscation != nil {
-			chatReq.TransformerMetadata["include_obfuscation"] = req.StreamOptions.IncludeObfuscation
-		}
 	}
 
 	// Convert instructions to system message
@@ -262,7 +320,7 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 	chatReq.Messages = messages
 
 	if len(req.Tools) > 0 {
-		tools, err := convertToolsToLLM(req.Tools)
+		tools, err := convertToolsToLLM(req.Tools, chatReq.TransformerMetadata)
 		if err != nil {
 			return nil, err
 		}
@@ -295,11 +353,30 @@ func convertToLLMRequest(req *Request, rawBody ...[]byte) (*llm.Request, error) 
 		chatReq.Verbosity = req.Text.Verbosity
 	}
 
+	var rawRequestBody []byte
 	if len(rawBody) > 0 {
-		attachOpenAIResponsesRequestExtensions(chatReq, req, rawBody[0])
+		rawRequestBody = rawBody[0]
+	}
+	attachOpenAIResponsesRequestExtensions(chatReq, req, rawRequestBody)
+	if len(rawRequestBody) > 0 {
+		if rawReasoning := extractRawReasoningObject(rawRequestBody); len(rawReasoning) > 0 {
+			chatReq.TransformerMetadata[responsesReasoningRawObjectTransformerMetadataKey] = rawReasoning
+		}
 	}
 
 	return chatReq, nil
+}
+
+func extractRawReasoningObject(rawBody []byte) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(rawBody, &obj); err != nil {
+		return nil
+	}
+	raw, ok := obj["reasoning"]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
 }
 
 // convertToolChoiceToLLM converts Responses API ToolChoice to llm.ToolChoice.
@@ -312,13 +389,26 @@ func convertToolChoiceToLLM(src *ToolChoice) *llm.ToolChoice {
 
 	if src.Mode != nil {
 		result.ToolChoice = src.Mode
-	} else if src.Type != nil && src.Name != nil {
+		return result
+	}
+	if src.Type == nil || src.Name == nil {
+		return nil
+	}
+
+	switch *src.Type {
+	case "custom":
+		result.OpenAIChatCustomToolChoice = &llm.OpenAIChatCustomToolChoice{
+			Name: *src.Name,
+		}
+	case "function":
 		result.NamedToolChoice = &llm.NamedToolChoice{
 			Type: *src.Type,
 			Function: llm.ToolFunction{
 				Name: *src.Name,
 			},
 		}
+	default:
+		return nil
 	}
 
 	return result
@@ -366,6 +456,20 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 			continue
 		}
 
+		// Chat Completions requires parallel tool calls to be represented in one
+		// assistant message with multiple tool_calls entries. Responses represents
+		// those calls as consecutive input items, so preserve that grouping before
+		// the following function_call_output items become individual tool messages.
+		if item.Type == "function_call" || item.Type == "custom_tool_call" {
+			msg, consumed, err := convertConsecutiveToolCalls(input.Items, i)
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, *msg)
+			i += consumed
+			continue
+		}
+
 		// Handle regular items
 		msg, err := convertItemToMessage(item)
 		if err != nil {
@@ -382,6 +486,79 @@ func convertInputToMessages(input *Input) ([]llm.Message, error) {
 	return messages, nil
 }
 
+// convertConsecutiveToolCalls merges adjacent Responses tool-call input items
+// into one canonical assistant message. The next output item deliberately ends
+// the group, so it is emitted as its own role="tool" message by the caller.
+//
+// Reasoning items that appear between a tool call and its tool output are also
+// attached to this assistant message. Chat providers validate tool history as
+// assistant(tool_calls) immediately followed by role=tool; an intervening
+// assistant-only reasoning message is rejected as a missing tool output.
+func convertConsecutiveToolCalls(items []Item, startIdx int) (*llm.Message, int, error) {
+	msg := &llm.Message{Role: "assistant"}
+	consumed := 0
+	var reasoningText strings.Builder
+
+	for index := startIdx; index < len(items); index++ {
+		item := &items[index]
+		switch item.Type {
+		case "function_call", "custom_tool_call":
+			toolCallMessage, err := convertItemToMessage(item)
+			if err != nil {
+				return nil, 0, err
+			}
+			if toolCallMessage != nil {
+				msg.ToolCalls = append(msg.ToolCalls, toolCallMessage.ToolCalls...)
+			}
+			consumed++
+		case "reasoning":
+			// Only fold mid-call reasoning once at least one tool call has been
+			// collected. Leading reasoning is handled by convertReasoningWithFollowing.
+			if len(msg.ToolCalls) == 0 {
+				if reasoningText.Len() > 0 {
+					msg.ReasoningContent = lo.ToPtr(reasoningText.String())
+				}
+				return msg, consumed, nil
+			}
+			if msg.ResponseReasoningItemID == nil {
+				reasoningItemID := item.ID
+				msg.ResponseReasoningItemID = &reasoningItemID
+			}
+			if msg.ReasoningSignature == nil && item.EncryptedContent != nil {
+				msg.ReasoningSignature = item.EncryptedContent
+			}
+			// Prefer raw reasoning_text content[] over summary when both exist.
+			itemText := strings.Builder{}
+			for _, part := range item.ReasoningContent {
+				if part.Text != "" {
+					itemText.WriteString(part.Text)
+				}
+			}
+			if itemText.Len() == 0 {
+				for _, summary := range item.Summary {
+					itemText.WriteString(summary.Text)
+				}
+			}
+			if itemText.Len() > 0 {
+				reasoningText.WriteString(itemText.String())
+			}
+			consumed++
+		default:
+			// function_call_output / custom_tool_call_output / other items end
+			// the assistant tool-call group so outputs stay adjacent.
+			if reasoningText.Len() > 0 {
+				msg.ReasoningContent = lo.ToPtr(reasoningText.String())
+			}
+			return msg, consumed, nil
+		}
+	}
+
+	if reasoningText.Len() > 0 {
+		msg.ReasoningContent = lo.ToPtr(reasoningText.String())
+	}
+	return msg, consumed, nil
+}
+
 // convertReasoningWithFollowing converts a reasoning item and merges it with subsequent
 // function_call items or text content into a single assistant message.
 // Returns the merged message and the number of items consumed.
@@ -391,18 +568,28 @@ func convertReasoningWithFollowing(items []Item, startIdx int) (*llm.Message, in
 	}
 
 	reasoningItem := &items[startIdx]
+	// Always mark Responses reasoning origin. Empty string means source omitted id;
+	// do not leave the pointer nil or outbound cannot distinguish from Chat/Anthropic
+	// ReasoningContent.
+	reasoningItemID := reasoningItem.ID
 	msg := &llm.Message{
-		Role:               "assistant",
-		ReasoningSignature: reasoningItem.EncryptedContent,
+		Role:                    "assistant",
+		ReasoningSignature:      reasoningItem.EncryptedContent,
+		ResponseReasoningItemID: &reasoningItemID,
 	}
 
-	// Extract reasoning content
+	// Prefer raw reasoning_text content[] over summary when both exist.
 	var reasoningText strings.Builder
-
-	for _, summary := range reasoningItem.Summary {
-		reasoningText.WriteString(summary.Text)
+	for _, part := range reasoningItem.ReasoningContent {
+		if part.Text != "" {
+			reasoningText.WriteString(part.Text)
+		}
 	}
-
+	if reasoningText.Len() == 0 {
+		for _, summary := range reasoningItem.Summary {
+			reasoningText.WriteString(summary.Text)
+		}
+	}
 	if reasoningText.Len() > 0 {
 		msg.ReasoningContent = lo.ToPtr(reasoningText.String())
 	}
@@ -417,8 +604,9 @@ func convertReasoningWithFollowing(items []Item, startIdx int) (*llm.Message, in
 		case "function_call":
 			// Merge function_call into the same assistant message
 			msg.ToolCalls = append(msg.ToolCalls, llm.ToolCall{
-				ID:   nextItem.CallID,
-				Type: "function",
+				ID:             nextItem.CallID,
+				ResponseItemID: nextItem.ID,
+				Type:           "function",
 				Function: llm.FunctionCall{
 					Name:      nextItem.Name,
 					Namespace: nextItem.Namespace,
@@ -435,12 +623,14 @@ func convertReasoningWithFollowing(items []Item, startIdx int) (*llm.Message, in
 			}
 
 			msg.ToolCalls = append(msg.ToolCalls, llm.ToolCall{
-				ID:   nextItem.CallID,
-				Type: llm.ToolTypeResponsesCustomTool,
+				ID:             nextItem.CallID,
+				ResponseItemID: nextItem.ID,
+				Type:           llm.ToolTypeResponsesCustomTool,
 				ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-					CallID: nextItem.CallID,
-					Name:   nextItem.Name,
-					Input:  inputStr,
+					CallID:    nextItem.CallID,
+					Name:      nextItem.Name,
+					Namespace: nextItem.Namespace,
+					Input:     inputStr,
 				},
 			})
 			consumed++
@@ -516,14 +706,48 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 
 		return nil, nil
 
+	case "input_audio":
+		// Input audio as a standalone item
+		if item.InputAudio != nil {
+			return &llm.Message{
+				Role: lo.Ternary(item.Role != "", item.Role, "user"),
+				Content: llm.MessageContent{
+					MultipleContent: []llm.MessageContentPart{
+						{
+							Type:       "input_audio",
+							InputAudio: item.InputAudio,
+						},
+					},
+				},
+			}, nil
+		}
+
+		return nil, nil
+
+	case "input_file":
+		part, err := convertContentItemToPart(item)
+		if err != nil || part == nil {
+			return nil, err
+		}
+
+		return &llm.Message{
+			Role: lo.Ternary(item.Role != "", item.Role, "user"),
+			Content: llm.MessageContent{
+				MultipleContent: []llm.MessageContentPart{*part},
+			},
+		}, nil
+
 	case "function_call":
-		// Function call from assistant - convert to tool call
+		// Function call from assistant - convert to tool call.
+		// item.ID is the Responses item identity; item.CallID is the tool-call
+		// correlation id. Keep them separate for same-protocol replay.
 		return &llm.Message{
 			Role: "assistant",
 			ToolCalls: []llm.ToolCall{
 				{
-					ID:   item.CallID,
-					Type: "function",
+					ID:             item.CallID,
+					ResponseItemID: item.ID,
+					Type:           "function",
 					Function: llm.FunctionCall{
 						Name:      item.Name,
 						Namespace: item.Namespace,
@@ -544,12 +768,14 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 			Role: "assistant",
 			ToolCalls: []llm.ToolCall{
 				{
-					ID:   item.CallID,
-					Type: llm.ToolTypeResponsesCustomTool,
+					ID:             item.CallID,
+					ResponseItemID: item.ID,
+					Type:           llm.ToolTypeResponsesCustomTool,
 					ResponseCustomToolCall: &llm.ResponseCustomToolCall{
-						CallID: item.CallID,
-						Name:   item.Name,
-						Input:  inputStr,
+						CallID:    item.CallID,
+						Name:      item.Name,
+						Namespace: item.Namespace,
+						Input:     inputStr,
 					},
 				},
 			},
@@ -561,6 +787,7 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 		}
 		// Function call output - convert to tool message
 		msg := &llm.Message{
+			ID:         item.ID,
 			Role:       "tool",
 			ToolCallID: lo.ToPtr(item.CallID),
 			Content:    convertToMessageContent(*item.Output),
@@ -577,6 +804,7 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 		}
 		// Custom tool call output - convert to tool message
 		msg := &llm.Message{
+			ID:         item.ID,
 			Role:       "tool",
 			ToolCallID: lo.ToPtr(item.CallID),
 			Content:    convertToMessageContent(*item.Output),
@@ -596,7 +824,8 @@ func convertItemToMessage(item *Item) (*llm.Message, error) {
 		return compactionMessageFromItem(item, item.Type), nil
 
 	default:
-		// Skip unknown types
+		// Unknown/raw-only input items are preserved via request extensions when the
+		// original body is available. Do not invent a canonical message shape here.
 		return nil, nil
 	}
 }
@@ -698,6 +927,40 @@ func convertContentItemToPart(item *Item) (*llm.MessageContentPart, error) {
 
 		return nil, nil
 
+	case "input_audio":
+		if item.InputAudio != nil {
+			return &llm.MessageContentPart{
+				ID:         item.ID,
+				Type:       "input_audio",
+				InputAudio: item.InputAudio,
+			}, nil
+		}
+
+		return nil, nil
+
+	case "input_file":
+		metadata := map[string]any{}
+		if item.FileURL != nil {
+			metadata[responsesInputFileURLPartTransformerMetadataKey] = item.FileURL
+		}
+		if item.Detail != nil {
+			metadata[responsesInputFileDetailPartTransformerMetadataKey] = item.Detail
+		}
+		if len(metadata) == 0 {
+			metadata = nil
+		}
+
+		return &llm.MessageContentPart{
+			ID:   item.ID,
+			Type: "file",
+			OpenAIChatFile: &llm.OpenAIChatFileContentPart{
+				FileData: item.FileData,
+				FileID:   item.FileID,
+				Filename: item.Filename,
+			},
+			TransformerMetadata: metadata,
+		}, nil
+
 	case "compaction", "compaction_summary":
 		return compactionContentPartFromItem(item, item.Type), nil
 
@@ -707,7 +970,7 @@ func convertContentItemToPart(item *Item) (*llm.MessageContentPart, error) {
 }
 
 // convertToolsToLLM converts Responses API tools to llm.Tool slice.
-func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
+func convertToolsToLLM(tools []Tool, metadata map[string]any) ([]llm.Tool, error) {
 	result := make([]llm.Tool, 0, len(tools))
 
 	for _, tool := range tools {
@@ -732,8 +995,10 @@ func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
 			result = append(result, llm.Tool{
 				Type: llm.ToolTypeImageGeneration,
 				ImageGeneration: &llm.ImageGeneration{
+					Model:             tool.Model,
 					Background:        tool.Background,
 					InputFidelity:     tool.InputFidelity,
+					InputImageMask:    tool.InputImageMask,
 					Moderation:        tool.Moderation,
 					OutputCompression: tool.OutputCompression,
 					OutputFormat:      tool.OutputFormat,
@@ -784,8 +1049,55 @@ func convertToolsToLLM(tools []Tool) ([]llm.Tool, error) {
 				ResponseCustomTool: customTool,
 			})
 
+		case "namespace":
+			// Record the composite-name → {leaf, namespace} mapping so the
+			// outbound side can restore the group identity via table lookup
+			// (never string splitting — group names may themselves contain "__").
+			var nsMap map[string]namespaceToolEntry
+			if metadata != nil {
+				if existing, ok := metadata[responsesNamespaceToolMapTransformerMetadataKey].(map[string]namespaceToolEntry); ok {
+					nsMap = existing
+				} else {
+					nsMap = make(map[string]namespaceToolEntry)
+				}
+			}
+			for _, subTool := range tool.Tools {
+				if subTool.Type != "function" {
+					continue
+				}
+				params, err := json.Marshal(subTool.Parameters)
+				if err != nil {
+					return nil, fmt.Errorf("failed to marshal namespace tool parameters: %w", err)
+				}
+				compositeName := tool.Name + "__" + subTool.Name
+				descriptionPrefix := tool.Description
+				if descriptionPrefix == "" {
+					descriptionPrefix = "Tools in the " + tool.Name + " namespace."
+				}
+				if nsMap != nil {
+					nsMap[compositeName] = namespaceToolEntry{
+						Leaf:      subTool.Name,
+						Namespace: tool.Name,
+					}
+				}
+				result = append(result, llm.Tool{
+					Type: "function",
+					Function: llm.Function{
+						Name:        compositeName,
+						Description: descriptionPrefix + "\n\n" + subTool.Description,
+						Parameters:  params,
+						Strict:      subTool.Strict,
+					},
+				})
+			}
+			if metadata != nil && nsMap != nil {
+				metadata[responsesNamespaceToolMapTransformerMetadataKey] = nsMap
+			}
+
 		default:
-			// Skip unsupported tool types
+			// Non-structural tools (tool_search/mcp/file_search/...) are preserved on
+			// ProviderExtensions.OpenAIResponses.Request for same-protocol replay and
+			// diagnosed on non-Responses outbounds. Do not invent llm.Tool shapes here.
 			continue
 		}
 	}
@@ -890,6 +1202,36 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		Status:             lo.ToPtr("completed"),
 		PreviousResponseID: chatResp.PreviousResponseID,
 	}
+	hasNativeNonTerminalStatus := false
+
+	// Backfill service_tier and error so they survive conversion back to
+	// the Responses API format (canonical carries both).
+	if chatResp.ServiceTier != "" {
+		resp.ServiceTier = lo.ToPtr(chatResp.ServiceTier)
+	}
+	if chatResp.Error != nil {
+		resp.Error = &Error{
+			Type:    chatResp.Error.Detail.Type,
+			Code:    chatResp.Error.Detail.Code,
+			Message: chatResp.Error.Detail.Message,
+		}
+	}
+	if chatResp.ProviderExtensions != nil && chatResp.ProviderExtensions.OpenAIResponses != nil &&
+		chatResp.ProviderExtensions.OpenAIResponses.Response != nil {
+		if nativeStatus := chatResp.ProviderExtensions.OpenAIResponses.Response.Status; nativeStatus != nil {
+			resp.Status = lo.ToPtr(*nativeStatus)
+			hasNativeNonTerminalStatus = true
+		}
+		raw := chatResp.ProviderExtensions.OpenAIResponses.Response.RawTopLevelFields["incomplete_details"]
+		// Explicit JSON null is restored by the raw allowlist path. Unmarshaling
+		// null into a typed struct would invent an empty object instead.
+		if len(raw) > 0 && string(raw) != "null" {
+			var details ResponseIncompleteDetails
+			if err := json.Unmarshal(raw, &details); err == nil {
+				resp.IncompleteDetails = &details
+			}
+		}
+	}
 
 	// Convert usage
 	resp.Usage = ConvertLLMUsageToResponsesUsage(chatResp.Usage)
@@ -913,7 +1255,7 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		}
 
 		// Handle reasoning content
-		if reasoningItem, ok := buildReasoningItem(*message); ok {
+		if reasoningItem, ok := buildReasoningItem(*message, chatResp.TransformerMetadata); ok {
 			resp.Output = append(resp.Output, reasoningItem)
 		}
 
@@ -921,36 +1263,85 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		if len(message.ToolCalls) > 0 {
 			for _, toolCall := range message.ToolCalls {
 				if toolCall.ResponseCustomToolCall != nil {
+					ctcItemID := toolCall.ResponseItemID
+					if ctcItemID == "" {
+						// Target envelope construction: never alias item id to call_id.
+						ctcItemID = generateItemID()
+					}
+					ctcStatus := toolCall.Status
+					if ctcStatus == "" {
+						ctcStatus = "completed"
+					}
 					resp.Output = append(resp.Output, Item{
-						ID:     toolCall.ID,
+						ID:        ctcItemID,
+						Type:      "custom_tool_call",
+						CallID:    toolCall.ResponseCustomToolCall.CallID,
+						Name:      toolCall.ResponseCustomToolCall.Name,
+						Namespace: toolCall.ResponseCustomToolCall.Namespace,
+						Input:     lo.ToPtr(toolCall.ResponseCustomToolCall.Input),
+						Status:    lo.ToPtr(ctcStatus),
+					})
+				} else if toolCall.OpenAIChatCustomToolCall != nil {
+					// Explicit Chat→Responses custom bridge for provider responses.
+					ctcItemID := toolCall.ResponseItemID
+					if ctcItemID == "" {
+						ctcItemID = generateItemID()
+					}
+					ctcStatus := toolCall.Status
+					if ctcStatus == "" {
+						ctcStatus = "completed"
+					}
+					resp.Output = append(resp.Output, Item{
+						ID:     ctcItemID,
 						Type:   "custom_tool_call",
-						CallID: toolCall.ResponseCustomToolCall.CallID,
-						Name:   toolCall.ResponseCustomToolCall.Name,
-						Input:  lo.ToPtr(toolCall.ResponseCustomToolCall.Input),
-						Status: lo.ToPtr("completed"),
+						CallID: toolCall.ID,
+						Name:   toolCall.OpenAIChatCustomToolCall.Name,
+						Input:  lo.ToPtr(toolCall.OpenAIChatCustomToolCall.Input),
+						Status: lo.ToPtr(ctcStatus),
 					})
 				} else {
+					fcItemID := toolCall.ResponseItemID
+					if fcItemID == "" {
+						// Target envelope construction: never alias item id to call_id.
+						fcItemID = generateItemID()
+					}
+					fcStatus := toolCall.Status
+					if fcStatus == "" {
+						fcStatus = "completed"
+					}
+					// Restore namespace group identity via table lookup (never string
+					// splitting — group names may contain "__").
+					fcName, fcNamespace := resolveNamespaceFromMetadata(chatResp.TransformerMetadata, toolCall.Function.Name)
 					resp.Output = append(resp.Output, Item{
-						ID:        toolCall.ID,
+						ID:        fcItemID,
 						Type:      "function_call",
 						CallID:    toolCall.ID,
-						Name:      toolCall.Function.Name,
-						Namespace: toolCall.Function.Namespace,
+						Name:      fcName,
+						Namespace: fcNamespace,
 						Arguments: toolCall.Function.Arguments,
-						Status:    lo.ToPtr("completed"),
+						Status:    lo.ToPtr(fcStatus),
 					})
 				}
 			}
 		}
 
-		// Handle text content
+		// Handle text content and/or refusal content parts.
+		// Preserve the historical precedence: scalar Content wins over MultipleContent.
 		if message.Content.Content != nil && *message.Content.Content != "" {
 			text := *message.Content.Content
-			contentItems, _ := attachAnnotationsToFirstTextItem([]Item{{
+			contentItems := []Item{{
 				Type:        "output_text",
 				Text:        &text,
 				Annotations: []Annotation{},
-			}}, message.Annotations)
+			}}
+			if message.Refusal != "" {
+				refusal := message.Refusal
+				contentItems = append(contentItems, Item{
+					Type:    "refusal",
+					Refusal: &refusal,
+				})
+			}
+			contentItems, _ = attachAnnotationsToFirstTextItem(contentItems, message.Annotations)
 			resp.Output = append(resp.Output, Item{
 				ID:   messageItemID,
 				Type: "message",
@@ -983,10 +1374,10 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 							Role:         "assistant",
 							Result:       lo.ToPtr(xurl.ExtractBase64FromDataURL(part.ImageURL.URL)),
 							Status:       lo.ToPtr("completed"),
-							Background:   xmap.GetStringPtr(part.TransformerMetadata, "background"),
-							OutputFormat: xmap.GetStringPtr(part.TransformerMetadata, "output_format"),
-							Quality:      xmap.GetStringPtr(part.TransformerMetadata, "quality"),
-							Size:         xmap.GetStringPtr(part.TransformerMetadata, "size"),
+							Background:   xmap.GetStringPtr(part.TransformerMetadata, responsesBackgroundTransformerMetadataKey),
+							OutputFormat: xmap.GetStringPtr(part.TransformerMetadata, responsesImageGenOutputFormatTransformerMetadataKey),
+							Quality:      xmap.GetStringPtr(part.TransformerMetadata, responsesImageGenQualityTransformerMetadataKey),
+							Size:         xmap.GetStringPtr(part.TransformerMetadata, responsesImageGenSizeTransformerMetadataKey),
 						}
 						resp.Output = append(resp.Output, imageItem)
 					}
@@ -997,6 +1388,13 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 				}
 			}
 
+			if message.Refusal != "" {
+				refusal := message.Refusal
+				contentItems = append(contentItems, Item{
+					Type:    "refusal",
+					Refusal: &refusal,
+				})
+			}
 			if len(contentItems) > 0 {
 				contentItems, _ = attachAnnotationsToFirstTextItem(contentItems, message.Annotations)
 				resp.Output = append(resp.Output, Item{
@@ -1007,10 +1405,23 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 					Status:  lo.ToPtr("completed"),
 				})
 			}
+		} else if message.Refusal != "" {
+			// Refusal-only assistant message (no text/multiple content).
+			refusal := message.Refusal
+			resp.Output = append(resp.Output, Item{
+				ID:   messageItemID,
+				Type: "message",
+				Role: "assistant",
+				Content: &Input{Items: []Item{{
+					Type:    "refusal",
+					Refusal: &refusal,
+				}}},
+				Status: lo.ToPtr("completed"),
+			})
 		}
 
 		// Set status based on finish reason
-		if choice.FinishReason != nil {
+		if choice.FinishReason != nil && !hasNativeNonTerminalStatus {
 			switch *choice.FinishReason {
 			case "stop":
 				resp.Status = lo.ToPtr("completed")
@@ -1020,12 +1431,17 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 				resp.Status = lo.ToPtr("completed")
 			case "error":
 				resp.Status = lo.ToPtr("failed")
+			case "cancelled", "canceled":
+				resp.Status = lo.ToPtr("canceled")
 			}
 		}
 	}
 
-	// If no output items were created, create an empty message
-	if len(resp.Output) == 0 {
+	// Preserve an intentionally empty output[] when the canonical response has
+	// no representable output or carries Responses-native raw output sidecars.
+	// A synthetic message is only needed for the legacy case where a canonical
+	// choice exists but did not produce an output item.
+	if len(resp.Output) == 0 && len(chatResp.Choices) > 0 && lo.FromPtr(resp.Status) == "completed" && !hasRawResponsesOutputItems(chatResp) {
 		emptyText := ""
 		resp.Output = []Item{
 			{
@@ -1046,7 +1462,64 @@ func convertToResponsesAPIResponse(chatResp *llm.Response) *Response {
 		}
 	}
 
+	resp.Output = mergeRawResponsesOutputItems(resp.Output, chatResp)
+
 	return resp
+}
+
+func hasRawResponsesOutputItems(chatResp *llm.Response) bool {
+	return chatResp != nil && chatResp.ProviderExtensions != nil &&
+		chatResp.ProviderExtensions.OpenAIResponses != nil &&
+		chatResp.ProviderExtensions.OpenAIResponses.Response != nil &&
+		len(chatResp.ProviderExtensions.OpenAIResponses.Response.RawOutputItems) > 0
+}
+
+func mergeRawResponsesOutputItems(structured []Item, chatResp *llm.Response) []Item {
+	if chatResp == nil || chatResp.ProviderExtensions == nil || chatResp.ProviderExtensions.OpenAIResponses == nil ||
+		chatResp.ProviderExtensions.OpenAIResponses.Response == nil {
+		return structured
+	}
+	rawFragments := chatResp.ProviderExtensions.OpenAIResponses.Response.RawOutputItems
+	if len(rawFragments) == 0 {
+		return structured
+	}
+
+	rawByIndex := make(map[int]json.RawMessage, len(rawFragments))
+	maxIndex := len(structured) + len(rawFragments) - 1
+	for _, fragment := range rawFragments {
+		if len(fragment.Raw) == 0 {
+			continue
+		}
+		rawByIndex[fragment.OriginalIndex] = fragment.Raw
+		if fragment.OriginalIndex > maxIndex {
+			maxIndex = fragment.OriginalIndex
+		}
+	}
+	if len(rawByIndex) == 0 {
+		return structured
+	}
+
+	merged := make([]Item, 0, maxIndex+1)
+	structuredIndex := 0
+	for index := 0; index <= maxIndex; index++ {
+		if raw, ok := rawByIndex[index]; ok {
+			var item Item
+			if err := json.Unmarshal(raw, &item); err == nil {
+				item.Raw = append(json.RawMessage(nil), raw...)
+				merged = append(merged, item)
+			}
+			continue
+		}
+		if structuredIndex < len(structured) {
+			merged = append(merged, structured[structuredIndex])
+			structuredIndex++
+		}
+	}
+	for structuredIndex < len(structured) {
+		merged = append(merged, structured[structuredIndex])
+		structuredIndex++
+	}
+	return merged
 }
 
 // generateItemID generates a unique item ID for output items.
@@ -1056,27 +1529,85 @@ func generateItemID() string {
 
 // buildReasoningItem creates a reasoning Item from a message's reasoning content and signature.
 // Returns the item and true if the message has reasoning data, otherwise returns zero value and false.
-func buildReasoningItem(msg llm.Message) (Item, bool) {
+// When response metadata carries original reasoning_text content[] / summary[], re-emit those shapes.
+func buildReasoningItem(msg llm.Message, responseMetadata map[string]any) (Item, bool) {
 	hasContent := msg.ReasoningContent != nil && *msg.ReasoningContent != ""
 	hasSignature := msg.ReasoningSignature != nil && *msg.ReasoningSignature != ""
+	rawTextParts := reasoningTextContentFromMetadata(responseMetadata)
+	savedSummary := reasoningSummaryFromMetadata(responseMetadata)
 
-	if !hasContent && !hasSignature {
+	if !hasContent && !hasSignature && len(rawTextParts) == 0 {
 		return Item{}, false
 	}
 
 	summary := []ReasoningSummary{}
-	if hasContent {
+	if len(savedSummary) > 0 {
+		summary = savedSummary
+	} else if hasContent && len(rawTextParts) == 0 {
+		// Common path only had opaque reasoning text; emit as summary_text for
+		// backward compatibility with existing stream/non-stream consumers.
 		summary = append(summary, ReasoningSummary{
 			Type: "summary_text",
 			Text: *msg.ReasoningContent,
 		})
 	}
 
-	return Item{
+	item := Item{
 		ID:               generateItemID(),
 		Type:             "reasoning",
 		Status:           lo.ToPtr("completed"),
 		Summary:          summary,
 		EncryptedContent: msg.ReasoningSignature,
-	}, true
+	}
+	// Only emit content[]/reasoning_text when the original Responses item had it.
+	// Common-only ReasoningContent continues to use summary_text for backward
+	// compatibility with existing clients/tests.
+	if len(rawTextParts) > 0 {
+		item.ReasoningContent = rawTextParts
+	}
+	return item, true
+}
+
+func reasoningTextContentFromMetadata(meta map[string]any) []ReasoningContent {
+	if meta == nil {
+		return nil
+	}
+	raw, ok := meta[responsesReasoningTextContentTransformerMetadataKey]
+	if !ok || raw == nil {
+		return nil
+	}
+	if parts, ok := raw.([]ReasoningContent); ok {
+		return append([]ReasoningContent(nil), parts...)
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var parts []ReasoningContent
+	if err := json.Unmarshal(data, &parts); err != nil {
+		return nil
+	}
+	return parts
+}
+
+func reasoningSummaryFromMetadata(meta map[string]any) []ReasoningSummary {
+	if meta == nil {
+		return nil
+	}
+	raw, ok := meta[responsesReasoningSummaryContentTransformerMetadataKey]
+	if !ok || raw == nil {
+		return nil
+	}
+	if parts, ok := raw.([]ReasoningSummary); ok {
+		return append([]ReasoningSummary(nil), parts...)
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var parts []ReasoningSummary
+	if err := json.Unmarshal(data, &parts); err != nil {
+		return nil
+	}
+	return parts
 }

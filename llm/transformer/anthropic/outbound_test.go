@@ -15,6 +15,9 @@ import (
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/internal/pkg/xjson"
 	"github.com/looplj/axonhub/llm/internal/pkg/xtest"
+	transformerpkg "github.com/looplj/axonhub/llm/transformer"
+	"github.com/looplj/axonhub/llm/transformer/openai/responses"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 func TestOutboundTransformer_TransformRequest(t *testing.T) {
@@ -954,6 +957,7 @@ func TestOutboundTransformer_TransformRequest_WithTestData(t *testing.T) {
 		name         string
 		requestFile  string
 		expectedFile string
+		expectError  bool
 		validate     func(t *testing.T, result *httpclient.Request, llmRequest *llm.Request)
 	}{
 		{
@@ -1026,10 +1030,12 @@ func TestOutboundTransformer_TransformRequest_WithTestData(t *testing.T) {
 			validate:     func(t *testing.T, result *httpclient.Request, llmRequest *llm.Request) {},
 		},
 		{
-			name:         "llm-parallel2_multiple_tool.request, from the Responses API",
-			requestFile:  "llm-parallel2_multiple_tool.request.json",
-			expectedFile: "anthropic-parallel2_multiple_tool.request.json",
-			validate:     func(t *testing.T, result *httpclient.Request, llmRequest *llm.Request) {},
+			// Split Responses-style tool_use turns followed by deferred results are
+			// not Anthropic-legal; previously the adapter hoisted results non-locally.
+			name:        "llm-parallel2_multiple_tool.request, from the Responses API",
+			requestFile: "llm-parallel2_multiple_tool.request.json",
+			expectError: true,
+			validate:    func(t *testing.T, result *httpclient.Request, llmRequest *llm.Request) {},
 		},
 	}
 
@@ -1047,6 +1053,11 @@ func TestOutboundTransformer_TransformRequest_WithTestData(t *testing.T) {
 
 			// Transform the request
 			result, err := transformer.TransformRequest(t.Context(), &llmReqquest)
+			if tt.expectError {
+				require.Error(t, err)
+				require.ErrorIs(t, err, transformerpkg.ErrInvalidRequest)
+				return
+			}
 			require.NoError(t, err)
 			require.NotNil(t, result)
 
@@ -1758,4 +1769,1307 @@ func TestOutboundTransformer_WebSearchParameters(t *testing.T) {
 			tt.validateTool(t, anthropicReq.Tools[0])
 		})
 	}
+}
+
+func TestOutboundTransformer_TransformRequest_ParallelToolCallsMapsToDisableParallelToolUse(t *testing.T) {
+	transformer, _ := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	cases := []struct {
+		name          string
+		parallelTool  *bool
+		expectDisable *bool
+	}{
+		{"explicit disable parallel", lo.ToPtr(false), lo.ToPtr(true)},
+		{"explicit allow parallel", lo.ToPtr(true), lo.ToPtr(false)},
+		{"unset parallel defaults allow", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chatReq := &llm.Request{
+				Model:             "claude-3-sonnet-20240229",
+				MaxTokens:         func() *int64 { v := int64(1024); return &v }(),
+				ParallelToolCalls: tc.parallelTool,
+				Tools:             []llm.Tool{{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "foo"}}},
+				Messages:          []llm.Message{{Role: "user", Content: llm.MessageContent{Content: func() *string { s := "hi"; return &s }()}}},
+			}
+			httpReq, err := transformer.TransformRequest(context.Background(), chatReq)
+			require.NoError(t, err)
+			var ar MessageRequest
+			require.NoError(t, json.Unmarshal(httpReq.Body, &ar))
+			var got *bool
+			if ar.ToolChoice != nil {
+				got = ar.ToolChoice.DisableParallelToolUse
+			}
+			if tc.expectDisable == nil {
+				require.Nil(t, got, "disable_parallel_tool_use should be absent")
+			} else {
+				require.NotNil(t, got)
+				require.Equal(t, *tc.expectDisable, *got)
+			}
+		})
+	}
+}
+
+func TestOutboundTransformer_TransformRequest_Opus48ReasoningHighUsesAdaptiveMaxEffort(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "claude-opus-4-8",
+		ReasoningEffort: "high",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+
+	require.Equal(t, int64(8192), anthropicReq.MaxTokens)
+	require.NotNil(t, anthropicReq.Thinking)
+	require.Equal(t, "adaptive", anthropicReq.Thinking.Type)
+	require.Zero(t, anthropicReq.Thinking.BudgetTokens)
+	require.NotNil(t, anthropicReq.OutputConfig)
+	require.Equal(t, "max", anthropicReq.OutputConfig.Effort)
+}
+
+func TestOutboundTransformer_TransformRequest_Opus48ReasoningMinimalUsesAdaptiveLowEffort(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "claude-opus-4-8",
+		ReasoningEffort: "minimal",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.NotNil(t, anthropicReq.Thinking)
+	require.Equal(t, "adaptive", anthropicReq.Thinking.Type)
+	require.Zero(t, anthropicReq.Thinking.BudgetTokens)
+	require.NotNil(t, anthropicReq.OutputConfig)
+	require.Equal(t, "low", anthropicReq.OutputConfig.Effort)
+}
+
+func TestOutboundTransformer_TransformRequest_DeepSeekDoesNotUseAnthropicAdaptivePolicy(t *testing.T) {
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		Type:                       PlatformDeepSeek,
+		ThinkingCapabilityOverride: ThinkingCapabilityAdaptiveOnly,
+		BaseURL:                    "https://api.deepseek.com",
+		APIKeyProvider:             auth.NewStaticKeyProvider("test-api-key"),
+	})
+	require.NoError(t, err)
+
+	result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "claude-opus-4-8",
+		ReasoningEffort: "high",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.Nil(t, anthropicReq.Thinking)
+	require.NotNil(t, anthropicReq.OutputConfig)
+	require.Equal(t, "high", anthropicReq.OutputConfig.Effort)
+}
+
+func TestOutboundTransformer_TransformRequest_ManualThinkingRejectsIllegalBudget(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name             string
+		maxTokens        int64
+		reasoningBudget  *int64
+		expectedErrorMsg string
+	}{
+		{
+			name:             "max tokens has no legal explicit manual-thinking budget",
+			maxTokens:        1024,
+			reasoningBudget:  lo.ToPtr(int64(1024)),
+			expectedErrorMsg: "max_tokens must be greater than 1024",
+		},
+		{
+			name:             "zero explicit budget",
+			maxTokens:        8192,
+			reasoningBudget:  lo.ToPtr(int64(0)),
+			expectedErrorMsg: "budget_tokens must be at least 1024",
+		},
+		{
+			name:             "negative explicit budget",
+			maxTokens:        8192,
+			reasoningBudget:  lo.ToPtr(int64(-1)),
+			expectedErrorMsg: "budget_tokens must be at least 1024",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := transformer.TransformRequest(t.Context(), &llm.Request{
+				Model:           "claude-3-7-sonnet-20250219",
+				MaxTokens:       lo.ToPtr(tt.maxTokens),
+				ReasoningEffort: "high",
+				ReasoningBudget: tt.reasoningBudget,
+				Messages: []llm.Message{
+					{
+						Role: "user",
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("Hello"),
+						},
+					},
+				},
+			})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.expectedErrorMsg)
+		})
+	}
+}
+
+func TestOutboundTransformer_TransformRequest_ToolChoiceNoneSkipsDisableParallelToolUse(t *testing.T) {
+	transformer, _ := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	chatReq := &llm.Request{
+		Model:             "claude-3-sonnet-20240229",
+		MaxTokens:         func() *int64 { v := int64(1024); return &v }(),
+		ParallelToolCalls: lo.ToPtr(false),
+		ToolChoice:        &llm.ToolChoice{ToolChoice: lo.ToPtr("none")},
+		Tools:             []llm.Tool{{Type: llm.ToolTypeFunction, Function: llm.Function{Name: "foo"}}},
+		Messages:          []llm.Message{{Role: "user", Content: llm.MessageContent{Content: func() *string { s := "hi"; return &s }()}}},
+	}
+	httpReq, err := transformer.TransformRequest(context.Background(), chatReq)
+	require.NoError(t, err)
+	var ar MessageRequest
+	require.NoError(t, json.Unmarshal(httpReq.Body, &ar))
+	require.NotNil(t, ar.ToolChoice, "tool_choice should be preserved as none")
+	require.Equal(t, "none", ar.ToolChoice.Type)
+	require.Nil(t, ar.ToolChoice.DisableParallelToolUse, "disable_parallel_tool_use must NOT be injected when tool_choice is none")
+}
+
+func TestConvertMultiplePartContent_Document(t *testing.T) {
+	t.Run("base64 document URL", func(t *testing.T) {
+		msg := llm.Message{
+			Role: "user",
+			Content: llm.MessageContent{
+				MultipleContent: []llm.MessageContentPart{
+					{
+						Type: "text",
+						Text: lo.ToPtr("analyze this PDF"),
+					},
+					{
+						Type: "document",
+						Document: &llm.DocumentURL{
+							URL:      "data:application/pdf;base64,JVBERi0xLjQ=",
+							MIMEType: "application/pdf",
+						},
+					},
+				},
+			},
+		}
+
+		content, ok := convertMultiplePartContent(msg)
+		require.True(t, ok)
+		require.Len(t, content.MultipleContent, 2)
+		require.Equal(t, "text", content.MultipleContent[0].Type)
+		require.Equal(t, "document", content.MultipleContent[1].Type)
+		require.NotNil(t, content.MultipleContent[1].Source)
+		require.Equal(t, "base64", content.MultipleContent[1].Source.Type)
+		require.Equal(t, "application/pdf", content.MultipleContent[1].Source.MediaType)
+		require.Equal(t, "JVBERi0xLjQ=", content.MultipleContent[1].Source.Data)
+	})
+
+	t.Run("url document", func(t *testing.T) {
+		msg := llm.Message{
+			Role: "user",
+			Content: llm.MessageContent{
+				MultipleContent: []llm.MessageContentPart{
+					{
+						Type: "document",
+						Document: &llm.DocumentURL{
+							URL: "https://example.com/doc.pdf",
+						},
+					},
+				},
+			},
+		}
+
+		content, ok := convertMultiplePartContent(msg)
+		require.True(t, ok)
+		require.Len(t, content.MultipleContent, 1)
+		require.Equal(t, "document", content.MultipleContent[0].Type)
+		require.NotNil(t, content.MultipleContent[0].Source)
+		require.Equal(t, "url", content.MultipleContent[0].Source.Type)
+		require.Equal(t, "https://example.com/doc.pdf", content.MultipleContent[0].Source.URL)
+	})
+}
+
+func TestConvertToAnthropicTrivialContent_Document(t *testing.T) {
+	content := llm.MessageContent{
+		MultipleContent: []llm.MessageContentPart{
+			{
+				Type: "text",
+				Text: lo.ToPtr("result text"),
+			},
+			{
+				Type: "document",
+				Document: &llm.DocumentURL{
+					URL:      "data:application/pdf;base64,JVBERi0xLjQ=",
+					MIMEType: "application/pdf",
+				},
+			},
+		},
+	}
+
+	result := convertToAnthropicTrivialContent(content)
+	require.NotNil(t, result)
+	require.Len(t, result.MultipleContent, 2)
+	require.Equal(t, "text", result.MultipleContent[0].Type)
+	require.Equal(t, "document", result.MultipleContent[1].Type)
+	require.NotNil(t, result.MultipleContent[1].Source)
+	require.Equal(t, "base64", result.MultipleContent[1].Source.Type)
+	require.Equal(t, "application/pdf", result.MultipleContent[1].Source.MediaType)
+	require.Equal(t, "JVBERi0xLjQ=", result.MultipleContent[1].Source.Data)
+}
+
+func TestExtractUserContentBlocks_WithImage(t *testing.T) {
+	msg := llm.Message{
+		Role: "user",
+		Content: llm.MessageContent{
+			MultipleContent: []llm.MessageContentPart{
+				{
+					Type: "text",
+					Text: lo.ToPtr("what is this?"),
+				},
+				{
+					Type: "image_url",
+					ImageURL: &llm.ImageURL{
+						URL: "https://example.com/photo.png",
+					},
+				},
+			},
+		},
+	}
+
+	blocks := extractUserContentBlocks(msg)
+	require.Len(t, blocks, 2)
+	require.Equal(t, "text", blocks[0].Type)
+	require.Equal(t, "image", blocks[1].Type)
+	require.NotNil(t, blocks[1].Source)
+	require.Equal(t, "url", blocks[1].Source.Type)
+	require.Equal(t, "https://example.com/photo.png", blocks[1].Source.URL)
+}
+
+func TestExtractUserContentBlocks_WithDocument(t *testing.T) {
+	msg := llm.Message{
+		Role: "user",
+		Content: llm.MessageContent{
+			MultipleContent: []llm.MessageContentPart{
+				{
+					Type: "text",
+					Text: lo.ToPtr("analyze this PDF"),
+				},
+				{
+					Type: "document",
+					Document: &llm.DocumentURL{
+						URL: "data:application/pdf;base64,JVBERi0xLjQ=",
+					},
+				},
+			},
+		},
+	}
+
+	blocks := extractUserContentBlocks(msg)
+	require.Len(t, blocks, 2)
+	require.Equal(t, "text", blocks[0].Type)
+	require.Equal(t, "document", blocks[1].Type)
+	require.NotNil(t, blocks[1].Source)
+	require.Equal(t, "base64", blocks[1].Source.Type)
+	require.Equal(t, "application/pdf", blocks[1].Source.MediaType)
+}
+
+func TestHasThinkingContent_WithReasoningField(t *testing.T) {
+	require.True(t, hasThinkingContent(llm.Message{Reasoning: lo.ToPtr("some reasoning")}))
+	require.False(t, hasThinkingContent(llm.Message{}))
+}
+
+func TestPrepareAnthropicReasoning_UnrecognizedSignature(t *testing.T) {
+	content := lo.ToPtr("thinking content")
+	sig := lo.ToPtr("unrecognized_signature_format")
+	config := &Config{Type: PlatformDirect}
+
+	resultContent, resultSig := prepareAnthropicReasoning(content, sig, config)
+
+	require.NotNil(t, resultContent)
+	require.Equal(t, "thinking content", *resultContent)
+	require.Nil(t, resultSig)
+}
+
+func TestBuildPreBlocks_ReasoningFallback(t *testing.T) {
+	// When ReasoningContent is nil but Reasoning is set,
+	// the thinking block should still be created using Reasoning.
+	msg := llm.Message{
+		Role:      "assistant",
+		Reasoning: lo.ToPtr("my reasoning text"),
+	}
+	config := &Config{Type: PlatformDirect}
+
+	blocks := buildPreBlocks(msg, config)
+
+	require.Len(t, blocks, 1)
+	require.Equal(t, "thinking", blocks[0].Type)
+	require.NotNil(t, blocks[0].Thinking)
+	require.Equal(t, "my reasoning text", *blocks[0].Thinking)
+}
+
+func TestBuildMessageContent_ReasoningFallback(t *testing.T) {
+	// When ReasoningContent is nil but Reasoning is set,
+	// buildMessageContent should produce a thinking block.
+	msg := llm.Message{
+		Role: "user",
+		Content: llm.MessageContent{
+			Content: lo.ToPtr("hello"),
+		},
+		Reasoning: lo.ToPtr("my reasoning text"),
+	}
+
+	content, ok := buildMessageContent(msg, nil)
+	require.True(t, ok)
+	require.Nil(t, content.Content)
+	require.Len(t, content.MultipleContent, 2)
+	require.Equal(t, "thinking", content.MultipleContent[0].Type)
+	require.NotNil(t, content.MultipleContent[0].Thinking)
+	require.Equal(t, "my reasoning text", *content.MultipleContent[0].Thinking)
+}
+
+func TestOutboundTransformer_TransformResponse_ImageBlock(t *testing.T) {
+	transformer, _ := NewOutboundTransformer("", "")
+
+	t.Run("base64 image", func(t *testing.T) {
+		httpResp := &httpclient.Response{
+			StatusCode: http.StatusOK,
+			Body: []byte(`{
+				"id": "msg_img1",
+				"type": "message",
+				"role": "assistant",
+				"content": [
+					{
+						"type": "image",
+						"source": {
+							"type": "base64",
+							"media_type": "image/png",
+							"data": "iVBORw0KGgo="
+						}
+					}
+				],
+				"model": "claude-3-sonnet-20240229",
+				"stop_reason": "end_turn"
+			}`),
+		}
+
+		result, err := transformer.TransformResponse(t.Context(), httpResp)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.Len(t, result.Choices, 1)
+		require.Len(t, result.Choices[0].Message.Content.MultipleContent, 1)
+
+		part := result.Choices[0].Message.Content.MultipleContent[0]
+		require.Equal(t, "image_url", part.Type)
+		require.NotNil(t, part.ImageURL)
+		require.Equal(t, "data:image/png;base64,iVBORw0KGgo=", part.ImageURL.URL)
+	})
+
+	t.Run("url image", func(t *testing.T) {
+		httpResp := &httpclient.Response{
+			StatusCode: http.StatusOK,
+			Body: []byte(`{
+				"id": "msg_img2",
+				"type": "message",
+				"role": "assistant",
+				"content": [
+					{
+						"type": "image",
+						"source": {
+							"type": "url",
+							"url": "https://example.com/image.png"
+						}
+					}
+				],
+				"model": "claude-3-sonnet-20240229",
+				"stop_reason": "end_turn"
+			}`),
+		}
+
+		result, err := transformer.TransformResponse(t.Context(), httpResp)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		require.Len(t, result.Choices, 1)
+		require.Len(t, result.Choices[0].Message.Content.MultipleContent, 1)
+
+		part := result.Choices[0].Message.Content.MultipleContent[0]
+		require.Equal(t, "image_url", part.Type)
+		require.NotNil(t, part.ImageURL)
+		require.Equal(t, "https://example.com/image.png", part.ImageURL.URL)
+	})
+}
+
+func TestOutboundTransformer_TransformResponse_ImageBlockIndex(t *testing.T) {
+	transformer, _ := NewOutboundTransformer("", "")
+
+	httpResp := &httpclient.Response{
+		StatusCode: http.StatusOK,
+		Body: []byte(`{
+			"id": "msg_imgidx",
+			"type": "message",
+			"role": "assistant",
+			"content": [
+				{
+					"type": "text",
+					"text": "Here is an image:"
+				},
+				{
+					"type": "image",
+					"source": {
+						"type": "url",
+						"url": "https://example.com/img.png"
+					}
+				}
+			],
+			"model": "claude-3-sonnet-20240229",
+			"stop_reason": "end_turn"
+		}`),
+	}
+
+	result, err := transformer.TransformResponse(t.Context(), httpResp)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, result.Choices, 1)
+
+	parts := result.Choices[0].Message.Content.MultipleContent
+	require.Len(t, parts, 2)
+
+	// Text block should have index 0
+	require.Equal(t, "text", parts[0].Type)
+	require.NotNil(t, parts[0].TransformerMetadata)
+	require.Equal(t, 0, parts[0].TransformerMetadata["anthropic_block_index"])
+
+	// Image block should have index 1
+	require.Equal(t, "image_url", parts[1].Type)
+	require.NotNil(t, parts[1].TransformerMetadata)
+	require.Equal(t, 1, parts[1].TransformerMetadata["anthropic_block_index"])
+}
+
+func TestOutboundTransformer_TransformRequest_AdaptiveOnlyModelRejectsExplicitManualBudget(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	_, err = transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "claude-opus-4-8",
+		MaxTokens:       lo.ToPtr(int64(8192)),
+		ReasoningEffort: "high",
+		ReasoningBudget: lo.ToPtr(int64(2048)),
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "manual thinking is not supported")
+}
+
+func TestOutboundTransformer_TransformRequest_ManualThinkingBudgetSafety(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	t.Run("explicit manual budget works without reasoning effort", func(t *testing.T) {
+		result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+			Model:           "claude-3-7-sonnet-20250219",
+			MaxTokens:       lo.ToPtr(int64(8192)),
+			ReasoningBudget: lo.ToPtr(int64(2048)),
+			Messages: []llm.Message{
+				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+			},
+		})
+		require.NoError(t, err)
+
+		var anthropicReq MessageRequest
+		require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+		require.NotNil(t, anthropicReq.Thinking)
+		require.Equal(t, "enabled", anthropicReq.Thinking.Type)
+		require.Equal(t, int64(2048), anthropicReq.Thinking.BudgetTokens)
+	})
+
+	t.Run("reasoning effort alone does not synthesize a manual budget", func(t *testing.T) {
+		configured, err := NewOutboundTransformerWithConfig(&Config{
+			Type:           PlatformDirect,
+			BaseURL:        "https://api.anthropic.com",
+			APIKeyProvider: auth.NewStaticKeyProvider("test-api-key"),
+		})
+		require.NoError(t, err)
+
+		result, err := configured.TransformRequest(t.Context(), &llm.Request{
+			Model:           "claude-3-7-sonnet-20250219",
+			MaxTokens:       lo.ToPtr(int64(8192)),
+			ReasoningEffort: "high",
+			Messages: []llm.Message{
+				{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+			},
+		})
+		require.NoError(t, err)
+
+		var anthropicReq MessageRequest
+		require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+		require.Nil(t, anthropicReq.Thinking)
+	})
+}
+
+func TestOutboundTransformer_TransformRequest_AnthropicReasoningXHighUsesMaxEffort(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "claude-opus-4-8",
+		ReasoningEffort: "xhigh",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.NotNil(t, anthropicReq.OutputConfig)
+	require.Equal(t, "max", anthropicReq.OutputConfig.Effort)
+	require.NotNil(t, anthropicReq.Thinking)
+	require.Equal(t, "adaptive", anthropicReq.Thinking.Type)
+	require.Zero(t, anthropicReq.Thinking.BudgetTokens)
+}
+
+func TestOutboundTransformer_TransformRequest_UnknownThinkingCapabilityDiagnosesDroppedEffort(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	request := &llm.Request{
+		APIFormat:       llm.APIFormatOpenAIResponse,
+		Model:           "third-party-claude-compatible",
+		ReasoningEffort: "high",
+		Messages: []llm.Message{
+			{
+				Role: "user",
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Hello"),
+				},
+			},
+		},
+	}
+
+	result, err := transformer.TransformRequest(t.Context(), request)
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.Nil(t, anthropicReq.Thinking)
+	require.Nil(t, anthropicReq.OutputConfig)
+	require.Equal(t, []llm.LossyDowngrade{
+		{
+			SourceProtocol: llm.APIFormatOpenAIResponse,
+			SourceField:    "reasoning.effort",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+	}, llm.LossyDowngrades(request))
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesChatPromptCacheRetentionLoss(t *testing.T) {
+	chatBody := []byte(`{
+		"model": "gpt-4o",
+		"messages": [{"role": "user", "content": "hello cache retention"}],
+		"prompt_cache_retention": "24h",
+		"n": 3
+	}`)
+
+	llmReq := &llm.Request{
+		Model:     "claude-3-sonnet-20240229",
+		APIFormat: llm.APIFormatOpenAIChatCompletion,
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("hello cache retention")},
+		}},
+		RawRequest: &httpclient.Request{
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body:    chatBody,
+		},
+	}
+
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	_, err = transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	require.ElementsMatch(t, []llm.LossyDowngrade{
+		{
+			SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+			SourceField:    "prompt_cache_retention",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+		{
+			SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+			SourceField:    "n",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+	}, llm.LossyDowngrades(llmReq))
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesChatOutputControlsLoss(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		body  string
+	}{
+		{
+			name:  "audio",
+			field: "audio",
+			body:  `{"model":"gpt-4o-audio-preview","messages":[{"role":"user","content":"speak"}],"audio":{"voice":"alloy","format":"wav","future_option":{"enabled":true}}}`,
+		},
+		{
+			name:  "prediction",
+			field: "prediction",
+			body:  `{"model":"gpt-4o","messages":[{"role":"user","content":"continue"}],"prediction":{"type":"content","content":"known output","future_prediction_flag":1}}`,
+		},
+		{
+			name:  "moderation",
+			field: "moderation",
+			body:  `{"model":"gpt-4o","messages":[{"role":"user","content":"check"}],"moderation":{"model":"omni-moderation-latest","future_policy":"strict-unknown"}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			llmReq := &llm.Request{
+				Model:     "claude-3-sonnet-20240229",
+				APIFormat: llm.APIFormatOpenAIChatCompletion,
+				MaxTokens: lo.ToPtr(int64(1024)),
+				Messages: []llm.Message{{
+					Role:    "user",
+					Content: llm.MessageContent{Content: lo.ToPtr("hello")},
+				}},
+				RawRequest: &httpclient.Request{
+					Headers: http.Header{"Content-Type": []string{"application/json"}},
+					Body:    []byte(tc.body),
+				},
+			}
+
+			transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+			require.NoError(t, err)
+			_, err = transformer.TransformRequest(t.Context(), llmReq)
+			require.NoError(t, err)
+
+			require.Equal(t, []llm.LossyDowngrade{{
+				SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+				SourceField:    tc.field,
+				TargetProtocol: llm.APIFormatAnthropicMessage,
+				Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+				Severity:       llm.LossyDowngradeSeverityWarning,
+			}}, llm.LossyDowngrades(llmReq))
+		})
+	}
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesChatWebSearchOptionsLoss(t *testing.T) {
+	chatBody := []byte(`{
+		"model": "gpt-4o",
+		"messages": [{"role": "user", "content": "search the news"}],
+		"web_search_options": {
+			"search_context_size": "low",
+			"future_option": {"enabled": true}
+		}
+	}`)
+	llmReq := &llm.Request{
+		Model:     "claude-3-sonnet-20240229",
+		APIFormat: llm.APIFormatOpenAIChatCompletion,
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("search the news")},
+		}},
+		RawRequest: &httpclient.Request{
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body:    chatBody,
+		},
+	}
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	_, err = transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+	require.Equal(t, []llm.LossyDowngrade{{
+		SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+		SourceField:    "web_search_options",
+		TargetProtocol: llm.APIFormatAnthropicMessage,
+		Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+		Severity:       llm.LossyDowngradeSeverityWarning,
+	}}, llm.LossyDowngrades(llmReq))
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesChatDeprecatedFunctionsLoss(t *testing.T) {
+	chatBody := []byte(`{
+		"model": "gpt-4o",
+		"messages": [{"role": "user", "content": "What is the weather in NYC?"}],
+		"functions": [{
+			"name": "get_weather",
+			"description": "Get weather",
+			"parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+		}],
+		"function_call": {"name": "get_weather"}
+	}`)
+	llmReq := &llm.Request{
+		Model:     "claude-3-sonnet-20240229",
+		APIFormat: llm.APIFormatOpenAIChatCompletion,
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("What is the weather in NYC?")},
+		}},
+		RawRequest: &httpclient.Request{
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+			Body:    chatBody,
+		},
+	}
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	_, err = transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+	require.Equal(t, []llm.LossyDowngrade{
+		{
+			SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+			SourceField:    "functions",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+		{
+			SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+			SourceField:    "function_call",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+	}, llm.LossyDowngrades(llmReq))
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesChatSamplingPenaltiesLoss(t *testing.T) {
+	llmReq := &llm.Request{
+		Model:            "claude-3-sonnet-20240229",
+		APIFormat:        llm.APIFormatOpenAIChatCompletion,
+		MaxTokens:        lo.ToPtr(int64(1024)),
+		FrequencyPenalty: lo.ToPtr(0.5),
+		PresencePenalty:  lo.ToPtr(0.25),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("hello penalties")},
+		}},
+	}
+
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	result, err := transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(result.Body, &body))
+	_, hasFrequency := body["frequency_penalty"]
+	_, hasPresence := body["presence_penalty"]
+	require.False(t, hasFrequency, "Anthropic body must omit frequency_penalty")
+	require.False(t, hasPresence, "Anthropic body must omit presence_penalty")
+
+	require.ElementsMatch(t, []llm.LossyDowngrade{
+		{
+			SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+			SourceField:    "frequency_penalty",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+		{
+			SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+			SourceField:    "presence_penalty",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+	}, llm.LossyDowngrades(llmReq))
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesResponsesSamplingPenaltiesLoss(t *testing.T) {
+	llmReq := &llm.Request{
+		Model:            "claude-3-sonnet-20240229",
+		APIFormat:        llm.APIFormatOpenAIResponse,
+		MaxTokens:        lo.ToPtr(int64(1024)),
+		FrequencyPenalty: lo.ToPtr(0.4),
+		PresencePenalty:  lo.ToPtr(0.1),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("hello responses penalties")},
+		}},
+	}
+
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	result, err := transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(result.Body, &body))
+	_, hasFrequency := body["frequency_penalty"]
+	_, hasPresence := body["presence_penalty"]
+	require.False(t, hasFrequency, "Anthropic body must omit frequency_penalty")
+	require.False(t, hasPresence, "Anthropic body must omit presence_penalty")
+
+	require.ElementsMatch(t, []llm.LossyDowngrade{
+		{
+			SourceProtocol: llm.APIFormatOpenAIResponse,
+			SourceField:    "frequency_penalty",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+		{
+			SourceProtocol: llm.APIFormatOpenAIResponse,
+			SourceField:    "presence_penalty",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+	}, llm.LossyDowngrades(llmReq))
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesChatSeedLoss(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed int64
+	}{
+		{name: "zero", seed: 0},
+		{name: "non_zero", seed: 42},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			llmReq := &llm.Request{
+				Model:     "claude-3-sonnet-20240229",
+				APIFormat: llm.APIFormatOpenAIChatCompletion,
+				MaxTokens: lo.ToPtr(int64(1024)),
+				Seed:      lo.ToPtr(tc.seed),
+				Messages: []llm.Message{{
+					Role:    "user",
+					Content: llm.MessageContent{Content: lo.ToPtr("hello seed")},
+				}},
+			}
+
+			transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+			require.NoError(t, err)
+			result, err := transformer.TransformRequest(t.Context(), llmReq)
+			require.NoError(t, err)
+
+			var body map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(result.Body, &body))
+			_, hasSeed := body["seed"]
+			require.False(t, hasSeed, "Anthropic body must omit seed")
+
+			require.Equal(t, []llm.LossyDowngrade{{
+				SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+				SourceField:    "seed",
+				TargetProtocol: llm.APIFormatAnthropicMessage,
+				Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+				Severity:       llm.LossyDowngradeSeverityWarning,
+			}}, llm.LossyDowngrades(llmReq))
+		})
+	}
+}
+
+func TestOutboundTransformer_TransformRequest_OmitsSamplingDiagnosticsWhenAbsent(t *testing.T) {
+	llmReq := &llm.Request{
+		Model:     "claude-3-sonnet-20240229",
+		APIFormat: llm.APIFormatOpenAIChatCompletion,
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("hello")},
+		}},
+	}
+
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	_, err = transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+	require.Empty(t, llm.LossyDowngrades(llmReq))
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesOpenAIMetadataOnlyLosses(t *testing.T) {
+	for _, sourceFormat := range []llm.APIFormat{
+		llm.APIFormatOpenAIChatCompletion,
+		llm.APIFormatOpenAIResponse,
+	} {
+		t.Run(string(sourceFormat), func(t *testing.T) {
+			llmReq := &llm.Request{
+				Model:            "claude-3-sonnet-20240229",
+				APIFormat:        sourceFormat,
+				MaxTokens:        lo.ToPtr(int64(1024)),
+				SafetyIdentifier: lo.ToPtr("safety_123"),
+				PromptCacheKey:   lo.ToPtr("cache_123"),
+				Metadata: map[string]string{
+					"user_id": "user_123",
+					"trace":   "trace_123",
+				},
+				Messages: []llm.Message{{
+					Role:    "user",
+					Content: llm.MessageContent{Content: lo.ToPtr("hello")},
+				}},
+			}
+
+			transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+			require.NoError(t, err)
+			result, err := transformer.TransformRequest(t.Context(), llmReq)
+			require.NoError(t, err)
+
+			var body map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(result.Body, &body))
+			require.JSONEq(t, `{"user_id":"user_123"}`, string(body["metadata"]))
+			require.NotContains(t, string(result.Body), "safety_123")
+			require.NotContains(t, string(result.Body), "cache_123")
+			require.NotContains(t, string(result.Body), "trace_123")
+
+			require.ElementsMatch(t, []llm.LossyDowngrade{
+				{
+					SourceProtocol: sourceFormat,
+					SourceField:    "safety_identifier",
+					TargetProtocol: llm.APIFormatAnthropicMessage,
+					Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+					Severity:       llm.LossyDowngradeSeverityWarning,
+				},
+				{
+					SourceProtocol: sourceFormat,
+					SourceField:    "prompt_cache_key",
+					TargetProtocol: llm.APIFormatAnthropicMessage,
+					Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+					Severity:       llm.LossyDowngradeSeverityWarning,
+				},
+				{
+					SourceProtocol: sourceFormat,
+					SourceField:    "metadata",
+					TargetProtocol: llm.APIFormatAnthropicMessage,
+					Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+					Severity:       llm.LossyDowngradeSeverityWarning,
+				},
+			}, llm.LossyDowngrades(llmReq))
+		})
+	}
+}
+
+
+func TestOutboundTransformer_TransformRequest_DiagnosesUnsupportedNativeTools(t *testing.T) {
+	llmReq := &llm.Request{
+		Model:     "claude-3-sonnet-20240229",
+		APIFormat: llm.APIFormatOpenAIResponse,
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("generate and search")},
+		}},
+		Tools: []llm.Tool{
+			{Type: llm.ToolTypeImageGeneration},
+			{Type: llm.ToolTypeGoogleSearch},
+			{Type: llm.ToolTypeGoogleCodeExecution},
+			{Type: llm.ToolTypeGoogleUrlContext},
+			{
+				Type: llm.ToolTypeFunction,
+				Function: llm.Function{
+					Name:        "calculator",
+					Description: "Perform calculations",
+				},
+			},
+		},
+	}
+
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	result, err := transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.Len(t, anthropicReq.Tools, 1)
+	require.Equal(t, "calculator", anthropicReq.Tools[0].Name)
+
+	require.ElementsMatch(t, []llm.LossyDowngrade{
+		{
+			SourceProtocol: llm.APIFormatOpenAIResponse,
+			SourceField:    "tools[].type=image_generation",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+		{
+			SourceProtocol: llm.APIFormatOpenAIResponse,
+			SourceField:    "tools[].type=google_search",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+		{
+			SourceProtocol: llm.APIFormatOpenAIResponse,
+			SourceField:    "tools[].type=google_code_execution",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+		{
+			SourceProtocol: llm.APIFormatOpenAIResponse,
+			SourceField:    "tools[].type=google_url_context",
+			TargetProtocol: llm.APIFormatAnthropicMessage,
+			Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+			Severity:       llm.LossyDowngradeSeverityWarning,
+		},
+	}, llm.LossyDowngrades(llmReq))
+}
+
+func TestOutboundTransformer_TransformRequest_DiagnosesWebSearchWhenPlatformLacksNativeTools(t *testing.T) {
+	llmReq := &llm.Request{
+		Model:     "claude-compatible",
+		APIFormat: llm.APIFormatOpenAIChatCompletion,
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("search something")},
+		}},
+		Tools: []llm.Tool{
+			{Type: llm.ToolTypeWebSearch},
+			{
+				Type: llm.ToolTypeFunction,
+				Function: llm.Function{
+					Name:        "calculator",
+					Description: "Perform calculations",
+				},
+			},
+		},
+	}
+
+	transformer, err := NewOutboundTransformerWithConfig(&Config{
+		Type:           PlatformDeepSeek,
+		BaseURL:        "https://api.deepseek.com",
+		APIKeyProvider: auth.NewStaticKeyProvider("test-key"),
+	})
+	require.NoError(t, err)
+	result, err := transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.Len(t, anthropicReq.Tools, 1)
+	require.Equal(t, "calculator", anthropicReq.Tools[0].Name)
+
+	require.Equal(t, []llm.LossyDowngrade{{
+		SourceProtocol: llm.APIFormatOpenAIChatCompletion,
+		SourceField:    "tools[].type=web_search",
+		TargetProtocol: llm.APIFormatAnthropicMessage,
+		Reason:         llm.LossyDowngradeReasonNoEquivalentSemantics,
+		Severity:       llm.LossyDowngradeSeverityWarning,
+	}}, llm.LossyDowngrades(llmReq))
+}
+
+func TestOutboundTransformer_TransformRequest_KeepsWebSearchWithoutLossOnDirectPlatform(t *testing.T) {
+	llmReq := &llm.Request{
+		Model:     "claude-3-sonnet-20240229",
+		APIFormat: llm.APIFormatOpenAIChatCompletion,
+		MaxTokens: lo.ToPtr(int64(1024)),
+		Messages: []llm.Message{{
+			Role:    "user",
+			Content: llm.MessageContent{Content: lo.ToPtr("search something")},
+		}},
+		Tools: []llm.Tool{
+			{Type: llm.ToolTypeWebSearch},
+		},
+	}
+
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	result, err := transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.Len(t, anthropicReq.Tools, 1)
+	require.Equal(t, "web_search", anthropicReq.Tools[0].Name)
+	require.Empty(t, llm.LossyDowngrades(llmReq))
+}
+
+
+func mustMarshalJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
+}
+
+
+func TestOutboundTransformer_TransformRequest_DiagnosesResponsesNativeToolLoss(t *testing.T) {
+	responsesInbound := responses.NewInboundTransformer()
+	inboundReq := &httpclient.Request{
+		Body: mustMarshalJSON(t, map[string]any{
+			"model": "gpt-5.5",
+			"input": []map[string]any{
+				{"type": "additional_tools", "tools": []map[string]any{{"type": "tool_search", "name": "search_docs"}}},
+				{"role": "user", "content": "use tools"},
+			},
+			"tools": []map[string]any{
+				{
+					"type": "namespace",
+					"name": "mcp__node_repl",
+					"tools": []map[string]any{{"type": "function", "name": "run", "parameters": map[string]any{"type": "object"}}},
+				},
+				{"type": "tool_search", "name": "search_docs", "namespace": "docs"},
+				{"type": "code_interpreter", "container": map[string]any{"type": "auto"}},
+			},
+			"client_metadata": map[string]any{"codex_version": "1.2.3"},
+		}),
+	}
+
+	llmReq, err := responsesInbound.TransformRequest(t.Context(), inboundReq)
+	require.NoError(t, err)
+	llmReq.Model = "claude-3-sonnet-20240229"
+	llmReq.MaxTokens = lo.ToPtr(int64(1024))
+
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-key")
+	require.NoError(t, err)
+	result, err := transformer.TransformRequest(t.Context(), llmReq)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	downgrades := llm.LossyDowngrades(llmReq)
+	require.NotEmpty(t, downgrades)
+
+	expectedFields := map[string]bool{
+		"tools[].type=namespace":        false,
+		"tools[].type=tool_search":      false,
+		"input[].type=additional_tools": false,
+		"tools[] raw-only native tool":  false,
+		"client_metadata":               false,
+	}
+	for _, d := range downgrades {
+		if _, ok := expectedFields[d.SourceField]; ok {
+			require.Equal(t, llm.APIFormatOpenAIResponse, d.SourceProtocol)
+			require.Equal(t, llm.APIFormatAnthropicMessage, d.TargetProtocol)
+			require.Equal(t, llm.LossyDowngradeReasonNoEquivalentSemantics, d.Reason)
+			expectedFields[d.SourceField] = true
+		}
+	}
+	for field, found := range expectedFields {
+		require.True(t, found, "missing LossyDowngrade for %s in %#v", field, downgrades)
+	}
+
+	diagnostics, ok := result.TransformerMetadata[shared.ResponsesLossyDowngradeDiagnosticsKey].(shared.ResponsesLossyDowngradeDiagnostics)
+	require.True(t, ok)
+	require.True(t, diagnostics.LossyDowngrade)
+	require.Equal(t, 1, diagnostics.NamespaceToolCount)
+	require.Equal(t, 1, diagnostics.ToolSearchToolCount)
+	require.Equal(t, 1, diagnostics.AdditionalToolsCount)
+	require.GreaterOrEqual(t, diagnostics.RawOnlyToolCount, 1)
+	require.Equal(t, 1, diagnostics.ClientMetadataCount)
+}
+
+
+func TestOutboundTransformer_TransformRequest_AdaptivePreferredPreservesExplicitManualBudget(t *testing.T) {
+	// claude-sonnet-4-6 is AdaptivePreferred: effort maps to adaptive, but an
+	// author-provided enabled+budget (same-protocol or explicit) must still emit
+	// thinking.type=enabled instead of hard-failing.
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "claude-sonnet-4-6",
+		APIFormat:       llm.APIFormatAnthropicMessage,
+		MaxTokens:       lo.ToPtr(int64(8192)),
+		ReasoningBudget: lo.ToPtr(int64(2048)),
+		TransformerMetadata: map[string]any{
+			TransformerMetadataKeyThinkingType: "enabled",
+		},
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+		},
+	})
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.NotNil(t, anthropicReq.Thinking)
+	require.Equal(t, "enabled", anthropicReq.Thinking.Type)
+	require.Equal(t, int64(2048), anthropicReq.Thinking.BudgetTokens)
+}
+
+func TestOutboundTransformer_TransformRequest_AdaptivePreferredAllowsBudgetWithoutMetadataOnSameProtocol(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	result, err := transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "claude-sonnet-4-6",
+		APIFormat:       llm.APIFormatAnthropicMessage,
+		MaxTokens:       lo.ToPtr(int64(8192)),
+		ReasoningBudget: lo.ToPtr(int64(4096)),
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+		},
+	})
+	require.NoError(t, err)
+
+	var anthropicReq MessageRequest
+	require.NoError(t, json.Unmarshal(result.Body, &anthropicReq))
+	require.NotNil(t, anthropicReq.Thinking)
+	require.Equal(t, "enabled", anthropicReq.Thinking.Type)
+	require.Equal(t, int64(4096), anthropicReq.Thinking.BudgetTokens)
+}
+
+func TestOutboundTransformer_TransformRequest_AdaptiveOnlyStillRejectsCrossProtocolManualBudget(t *testing.T) {
+	transformer, err := NewOutboundTransformer("https://api.anthropic.com", "test-api-key")
+	require.NoError(t, err)
+
+	_, err = transformer.TransformRequest(t.Context(), &llm.Request{
+		Model:           "claude-opus-4-8",
+		APIFormat:       llm.APIFormatOpenAIChatCompletion,
+		MaxTokens:       lo.ToPtr(int64(8192)),
+		ReasoningBudget: lo.ToPtr(int64(2048)),
+		Messages: []llm.Message{
+			{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Hello")}},
+		},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "manual thinking is not supported")
 }
